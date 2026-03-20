@@ -1,0 +1,535 @@
+# microgpt_ultimate_vectorized_attention_seqrefactor.py
+# 事前调整版：按“序列级 API / sampler / 预编码缓存 / Trainer 变薄”的结构重构
+# 不引入 PyTorch；数值语义保持与原始实现一致（仍基于 Value 标量 autograd）。
+#
+# 核心变化：
+# 1) 训练前预先 encode 全部 docs，Trainer 不再每 step encode
+# 2) 增加 NameSampler：从 names.txt 的“单行名字”构造 (x_seq, y_seq)
+# 3) MicroGPT 增加 forward_seq：外部一次传入一段 token ids，内部仍逐 timestep forward
+# 4) 增加 sequence_cross_entropy：序列级 loss
+# 5) Trainer 主循环变薄：sample -> forward_seq -> seq_loss -> backward -> step
+
+import os
+import math
+import random
+import urllib.request
+from dataclasses import dataclass
+from typing import List, Sequence, Callable, Optional, Tuple
+
+random.seed(42)
+
+Vec = List["Value"]
+Mat = List[Vec]
+
+
+@dataclass
+class Config:
+    input_path: str = "input.txt"
+    fallback_url: str = "https://raw.githubusercontent.com/karpathy/makemore/988aa59/names.txt"
+
+    n_layer: int = 1
+    n_embd: int = 16
+    block_size: int = 16
+    n_head: int = 4
+
+    num_steps: int = 1000
+    learning_rate: float = 0.01
+    beta1: float = 0.85
+    beta2: float = 0.99
+    eps_adam: float = 1e-8
+
+    temperature: float = 0.5
+    n_samples: int = 20
+
+    # --- 事前调整：采样策略（先默认与原版等价：每 step 一个名字，从开头训练）---
+    random_offset: bool = False  # True 则从名字内部随机起点切片（更像 LM）
+    batch_size: int = 1          # 结构预留；当前实现仍是逐样本累加（非向量化）
+
+
+cfg = Config()
+
+
+# -------------------------
+# 数据与分词器
+# -------------------------
+def load_docs(path: str, fallback_url: str) -> List[str]:
+    if not os.path.exists(path):
+        urllib.request.urlretrieve(fallback_url, path)
+    with open(path, "r", encoding="utf-8") as f:
+        docs = [line.strip() for line in f if line.strip()]
+    random.shuffle(docs)
+    return docs
+
+
+class CharTokenizer:
+    def __init__(self, docs: Sequence[str]):
+        self.uchars = sorted(set("".join(docs)))
+        self.BOS = len(self.uchars)
+        self.vocab_size = len(self.uchars) + 1
+
+    def encode(self, s: str) -> List[int]:
+        return [self.uchars.index(c) for c in s]
+
+    def encode_with_bos(self, doc: str) -> List[int]:
+        return [self.BOS] + self.encode(doc) + [self.BOS]
+
+    def decode(self, ids: Sequence[int]) -> str:
+        return "".join(self.uchars[i] for i in ids if i != self.BOS)
+
+
+# -------------------------
+# Autograd: Value
+# -------------------------
+class Value:
+    __slots__ = ("data", "grad", "_children", "_local_grads")
+
+    def __init__(self, data: float, children=(), local_grads=()):
+        self.data = data
+        self.grad = 0.0
+        self._children = children
+        self._local_grads = local_grads
+
+    def __add__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        return Value(self.data + other.data, (self, other), (1, 1))
+
+    def __mul__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        return Value(self.data * other.data, (self, other), (other.data, self.data))
+
+    def __pow__(self, other):
+        return Value(self.data ** other, (self,), (other * self.data ** (other - 1),))
+
+    def log(self):
+        return Value(math.log(self.data), (self,), (1 / self.data,))
+
+    def exp(self):
+        e = math.exp(self.data)
+        return Value(e, (self,), (e,))
+
+    def relu(self):
+        return Value(max(0, self.data), (self,), (float(self.data > 0),))
+
+    def __neg__(self):
+        return self * -1
+
+    def __radd__(self, other):
+        return self + other
+
+    def __sub__(self, other):
+        return self + (-other)
+
+    def __rsub__(self, other):
+        return other + (-self)
+
+    def __rmul__(self, other):
+        return self * other
+
+    def __truediv__(self, other):
+        return self * other ** -1
+
+    def __rtruediv__(self, other):
+        return other * self ** -1
+
+    def backward(self):
+        node_stack = [self]
+        flag_stack = [0]
+        visited_ids = set()
+        topo = []
+        append_node = node_stack.append
+        append_flag = flag_stack.append
+        pop_node = node_stack.pop
+        pop_flag = flag_stack.pop
+
+        while node_stack:
+            v = pop_node()
+            f = pop_flag()
+            vid = id(v)
+            if f:
+                topo.append(v)
+                continue
+            if vid in visited_ids:
+                continue
+            visited_ids.add(vid)
+            append_node(v)
+            append_flag(1)
+            for c in v._children:
+                append_node(c)
+                append_flag(0)
+
+        self.grad = 1.0
+        for v in reversed(topo):
+            gv = v.grad
+            if gv == 0.0:
+                continue
+            children = v._children
+            lgs = v._local_grads
+            for i in range(len(children)):
+                children[i].grad += lgs[i] * gv
+
+    def __repr__(self):
+        return f"Value(data={self.data:.4f}, grad={self.grad:.4f})"
+
+
+# -------------------------
+# Numeric ops
+# -------------------------
+def matrix(nout: int, nin: int, std: float = 0.08) -> Mat:
+    return [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
+
+
+def linear(x: Vec, w: Mat) -> Vec:
+    return [sum(wi * xi for wi, xi in zip(wo, x)) for wo in w]
+
+
+def softmax(logits: Sequence[Value]) -> Vec:
+    logits = list(logits)
+    max_val = max(v.data for v in logits)
+    exps = [(v - max_val).exp() for v in logits]
+    total = sum(exps)
+    return [e / total for e in exps]
+
+
+def rmsnorm(x: Vec) -> Vec:
+    ms = sum(xi * xi for xi in x) / len(x)
+    scale = (ms + 1e-5) ** -0.5
+    return [xi * scale for xi in x]
+
+
+# -------------------------
+# KV cache
+# -------------------------
+class KVCache:
+    def __init__(self, n_layer: int):
+        self.keys: List[List[Vec]] = [[] for _ in range(n_layer)]
+        self.values: List[List[Vec]] = [[] for _ in range(n_layer)]
+
+    def append(self, layer_idx: int, k: Vec, v: Vec):
+        self.keys[layer_idx].append(k)
+        self.values[layer_idx].append(v)
+
+    def get_keys(self, layer_idx: int) -> List[Vec]:
+        return self.keys[layer_idx]
+
+    def get_values(self, layer_idx: int) -> List[Vec]:
+        return self.values[layer_idx]
+
+    def reset(self):
+        for ks, vs in zip(self.keys, self.values):
+            ks.clear()
+            vs.clear()
+
+
+# -------------------------
+# Model
+# -------------------------
+class Layer:
+    def __init__(self, n_embd: int):
+        self.attn_wq = matrix(n_embd, n_embd)
+        self.attn_wk = matrix(n_embd, n_embd)
+        self.attn_wv = matrix(n_embd, n_embd)
+        self.attn_wo = matrix(n_embd, n_embd)
+
+        self.mlp_fc1 = matrix(4 * n_embd, n_embd)
+        self.mlp_fc2 = matrix(n_embd, 4 * n_embd)
+
+    @property
+    def params(self) -> List[Value]:
+        mats = [self.attn_wq, self.attn_wk, self.attn_wv, self.attn_wo, self.mlp_fc1, self.mlp_fc2]
+        return [p for mat in mats for row in mat for p in row]
+
+
+class MicroGPT:
+    def __init__(self, vocab_size: int, n_layer: int, n_embd: int, block_size: int, n_head: int):
+        self.vocab_size = vocab_size
+        self.n_layer = n_layer
+        self.n_embd = n_embd
+        self.block_size = block_size
+        self.n_head = n_head
+        self.head_dim = n_embd // n_head
+
+        self.wte = matrix(vocab_size, n_embd)
+        self.wpe = matrix(block_size, n_embd)
+        self.lm_head = matrix(vocab_size, n_embd)
+        self.layers = [Layer(n_embd) for _ in range(n_layer)]
+
+    @property
+    def params(self) -> List[Value]:
+        emb_params = [p for mat in [self.wte, self.wpe, self.lm_head] for row in mat for p in row]
+        layer_params = [p for layer in self.layers for p in layer.params]
+        return emb_params + layer_params
+
+    def forward(self, token_id: int, pos_id: int, cache: KVCache) -> Vec:
+        tok_emb = self.wte[token_id]
+        pos_emb = self.wpe[pos_id]
+        x = [t + p for t, p in zip(tok_emb, pos_emb)]
+        x = rmsnorm(x)
+
+        for li, layer in enumerate(self.layers):
+            x_res = x
+            x = rmsnorm(x)
+
+            q = linear(x, layer.attn_wq)
+            k = linear(x, layer.attn_wk)
+            v = linear(x, layer.attn_wv)
+
+            cache.append(li, k, v)
+
+            seq_keys = cache.get_keys(li)
+            seq_vals = cache.get_values(li)
+            seq_len = len(seq_keys)
+            sqrt_d = self.head_dim ** 0.5
+
+            q_heads = [q[h * self.head_dim:(h + 1) * self.head_dim] for h in range(self.n_head)]
+            x_attn: Vec = []
+
+            for h, q_h in enumerate(q_heads):
+                hs = h * self.head_dim
+                k_h = [k_vec[hs:hs + self.head_dim] for k_vec in seq_keys]
+                v_h = [v_vec[hs:hs + self.head_dim] for v_vec in seq_vals]
+
+                attn_logits = [sum(qj * ktj for qj, ktj in zip(q_h, k_t)) / sqrt_d for k_t in k_h]
+                attn_weights = softmax(attn_logits)
+
+                head_out: Vec = []
+                for j in range(self.head_dim):
+                    s = Value(0.0)
+                    for t in range(seq_len):
+                        s = s + attn_weights[t] * v_h[t][j]
+                    head_out.append(s)
+                x_attn.extend(head_out)
+
+            x = linear(x_attn, layer.attn_wo)
+            x = [a + b for a, b in zip(x, x_res)]
+
+            x_res = x
+            x = rmsnorm(x)
+            x = linear(x, layer.mlp_fc1)
+            x = [xi.relu() for xi in x]
+            x = linear(x, layer.mlp_fc2)
+            x = [a + b for a, b in zip(x, x_res)]
+
+        logits = linear(x, self.lm_head)
+        return logits
+
+    # ----------- 事前调整：序列级 API（外部不再逐 timestep 调 forward）-----------
+    def forward_seq(self, x_ids: Sequence[int]) -> List[Vec]:
+        """
+        输入：长度 T 的 token ids
+        输出：长度 T 的 logits_seq，其中 logits_seq[t] 是 vocab_size 的 Vec[Value]
+        说明：内部仍逐 timestep 调现有 forward，但 Trainer 不再知道这些细节，
+              将来替换为真正的张量化实现时，只需要改这里的内部实现。
+        """
+        cache = KVCache(self.n_layer)
+        logits_seq: List[Vec] = []
+        T = len(x_ids)
+        # 位置编码长度受 block_size 限制
+        if T > self.block_size:
+            raise ValueError(f"Sequence length {T} exceeds block_size {self.block_size}")
+        for pos_id in range(T):
+            logits = self.forward(int(x_ids[pos_id]), pos_id, cache)
+            logits_seq.append(logits)
+        return logits_seq
+
+
+# -------------------------
+# Optimizer
+# -------------------------
+class Adam:
+    def __init__(self, params: List[Value], lr: float, beta1: float, beta2: float, eps: float):
+        self.params = params
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.m = [0.0] * len(params)
+        self.v = [0.0] * len(params)
+        self.step_idx = 0
+
+    def step(self, lr_scale: float = 1.0):
+        self.step_idx += 1
+        lr_t = self.lr * lr_scale
+        for i, p in enumerate(self.params):
+            self.m[i] = self.beta1 * self.m[i] + (1 - self.beta1) * p.grad
+            self.v[i] = self.beta2 * self.v[i] + (1 - self.beta2) * (p.grad ** 2)
+            m_hat = self.m[i] / (1 - self.beta1 ** self.step_idx)
+            v_hat = self.v[i] / (1 - self.beta2 ** self.step_idx)
+            p.data -= lr_t * m_hat / (v_hat ** 0.5 + self.eps)
+            p.grad = 0.0
+
+
+# -------------------------
+# 事前调整：Sampler / 序列 loss
+# -------------------------
+class NameSampler:
+    """
+    针对 names.txt（一行一个名字）的采样器：
+    - 输入：预编码后的 encoded_docs（每个元素是 [BOS] + name + [BOS]）
+    - 输出：一条训练样本 (x_seq, y_seq)，长度 T<=block_size
+    """
+    def __init__(self, encoded_docs: Sequence[Sequence[int]], block_size: int, random_offset: bool = False):
+        self.encoded_docs = list(encoded_docs)
+        self.block_size = int(block_size)
+        self.random_offset = bool(random_offset)
+        self._idx = 0  # 用于可复现的轮转取样（与原版 step%len(docs) 类似）
+
+    def next_one(self) -> Tuple[List[int], List[int]]:
+        tokens = self.encoded_docs[self._idx]
+        self._idx = (self._idx + 1) % len(self.encoded_docs)
+
+        # 至少要有 2 个 token 才能构造 x/y
+        if len(tokens) < 2:
+            return [tokens[0]], [tokens[0]]
+
+        # 选择起点：默认 0（与“从 BOS 开始训练整行名字”一致）
+        if self.random_offset:
+            # 保证还有 target：起点最多到 len(tokens)-2
+            start = random.randint(0, len(tokens) - 2)
+        else:
+            start = 0
+
+        # 可用长度（确保 y 存在）
+        max_T = len(tokens) - 1 - start
+        T = min(self.block_size, max_T)
+        x = list(tokens[start:start + T])
+        y = list(tokens[start + 1:start + T + 1])
+        return x, y
+
+    def next_batch(self, batch_size: int) -> List[Tuple[List[int], List[int]]]:
+        return [self.next_one() for _ in range(batch_size)]
+
+
+def sequence_cross_entropy(logits_seq: Sequence[Vec], y_ids: Sequence[int]) -> Value:
+    """
+    logits_seq: 长度 T，每项是 vocab_size 的 Vec[Value]
+    y_ids:      长度 T，每项是 int target id
+    返回：平均 cross-entropy loss（Value）
+    """
+    T = len(logits_seq)
+    if T == 0:
+        return Value(0.0)
+    if len(y_ids) != T:
+        raise ValueError("y_ids length must match logits_seq length")
+
+    losses: List[Value] = []
+    for t in range(T):
+        probs = softmax(logits_seq[t])
+        losses.append(-probs[int(y_ids[t])].log())
+    return (1 / T) * sum(losses)
+
+
+# -------------------------
+# Trainer
+# -------------------------
+class Trainer:
+    def __init__(
+        self,
+        model: MicroGPT,
+        optimizer: Adam,
+        sampler: NameSampler,
+        cfg: Config,
+    ):
+        self.model = model
+        self.opt = optimizer
+        self.sampler = sampler
+        self.cfg = cfg
+
+    def train(self, progress_callback: Optional[Callable[[int, float], None]] = None):
+        print(f"vocab size: {self.model.vocab_size}")
+        print(f"num params: {len(self.model.params)}")
+
+        for step in range(self.cfg.num_steps):
+            batch = self.sampler.next_batch(self.cfg.batch_size)
+
+            # 结构预留：当前仍逐样本累加（不是向量化 batch）
+            batch_losses: List[Value] = []
+            for x_ids, y_ids in batch:
+                logits_seq = self.model.forward_seq(x_ids)
+                loss = sequence_cross_entropy(logits_seq, y_ids)
+                batch_losses.append(loss)
+
+            loss_total = (1 / len(batch_losses)) * sum(batch_losses)
+            loss_total.backward()
+
+            lr_scale = 1 - step / self.cfg.num_steps
+            self.opt.step(lr_scale)
+
+            if progress_callback:
+                progress_callback(step + 1, loss_total.data)
+            else:
+                print(f"step {step+1:4d} / {self.cfg.num_steps:4d} | loss {loss_total.data:.4f}", end="\r")
+        print()
+
+
+# -------------------------
+# Generator
+# -------------------------
+class Generator:
+    def __init__(self, model: MicroGPT, tokenizer: CharTokenizer, cfg: Config):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.cfg = cfg
+
+    def generate_one(self) -> str:
+        cache = KVCache(self.model.n_layer)
+        token_id = self.tokenizer.BOS
+        chars: List[str] = []
+
+        for pos_id in range(self.model.block_size):
+            logits = self.model.forward(token_id, pos_id, cache)
+            probs = softmax([l / self.cfg.temperature for l in logits])
+            token_id = random.choices(
+                range(self.tokenizer.vocab_size),
+                weights=[p.data for p in probs]
+            )[0]
+            if token_id == self.tokenizer.BOS:
+                break
+            chars.append(self.tokenizer.uchars[token_id])
+        return "".join(chars)
+
+    def generate(self, n_samples: int):
+        print("\n--- inference (new, hallucinated names) ---")
+        for i in range(n_samples):
+            print(f"sample {i+1:2d}: {self.generate_one()}")
+
+
+# -------------------------
+# Main
+# -------------------------
+def main():
+    docs = load_docs(cfg.input_path, cfg.fallback_url)
+    tokenizer = CharTokenizer(docs)
+
+    # 事前调整：训练前一次性预编码缓存（Trainer 不再重复 encode）
+    encoded_docs = [tokenizer.encode_with_bos(d) for d in docs]
+
+    model = MicroGPT(
+        vocab_size=tokenizer.vocab_size,
+        n_layer=cfg.n_layer,
+        n_embd=cfg.n_embd,
+        block_size=cfg.block_size,
+        n_head=cfg.n_head,
+    )
+    opt = Adam(
+        model.params,
+        lr=cfg.learning_rate,
+        beta1=cfg.beta1,
+        beta2=cfg.beta2,
+        eps=cfg.eps_adam,
+    )
+
+    sampler = NameSampler(
+        encoded_docs=encoded_docs,
+        block_size=cfg.block_size,
+        random_offset=cfg.random_offset,
+    )
+
+    trainer = Trainer(model=model, optimizer=opt, sampler=sampler, cfg=cfg)
+    trainer.train()
+
+    gen = Generator(model, tokenizer, cfg)
+    gen.generate(cfg.n_samples)
+
+
+if __name__ == "__main__":
+    main()

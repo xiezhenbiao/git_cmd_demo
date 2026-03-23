@@ -1,0 +1,647 @@
+# microgpt_v3.py
+# 事前调整版：按“序列级 API / sampler / 预编码缓存 / Trainer 变薄”的结构重构
+# 不引入 PyTorch；数值语义保持与原始实现一致（仍基于 Value 标量 autograd）。
+#
+# 核心变化：
+# 1) 训练前预先 encode 全部 docs，Trainer 不再每 step encode
+# 2) 增加 NameSampler：从 names.txt 的“单行名字”构造 (x_seq, y_seq)
+# 3) MicroGPT 增加 forward_seq：外部一次传入一段 token ids，内部仍逐 timestep forward
+# 4) 增加 sequence_cross_entropy：序列级 loss
+# 5) Trainer 主循环变薄：sample -> forward_seq -> seq_loss -> backward -> step
+
+import os
+import math
+import random
+import urllib.request
+from dataclasses import dataclass
+from typing import List, Sequence, Callable, Optional, Tuple
+
+# 为可重复性固定随机种子（影响权重初始化和采样）
+random.seed(42)
+
+# -------------------------
+# 类型别名（Type Aliases）
+# -------------------------
+# Vec 表示向量（元素为 Value）
+Vec = List['Value']  # vector of Values
+# Mat 表示矩阵（行的列表，每行是 Vec）
+Mat = List[Vec]      # matrix of Values
+
+# -------------------------
+# 配置（Config）
+# -------------------------
+@dataclass
+class Config:
+    # 配置用 dataclass，方便集中管理超参数与路径
+    input_path: str = "input.txt"  # 训练文本路径，如果不存在会用 fallback_url 下载
+    fallback_url: str = "https://raw.githubusercontent.com/karpathy/makemore/988aa59/names.txt"
+    n_layer: int = 1               # Transformer 层数（很小的 micro model）
+    n_embd: int = 16               # embedding 维度（模型宽度）
+    block_size: int = 16           # 最大上下文长度（sequence length）
+    n_head: int = 4                # multi-head attention 的头数
+    num_steps: int = 1000          # 训练步数
+    learning_rate: float = 0.01    # 学习率
+    beta1: float = 0.85            # Adam beta1
+    beta2: float = 0.99            # Adam beta2
+    eps_adam: float = 1e-8         # Adam 的数值稳定项
+    temperature: float = 0.5       # 采样温度（生成时）
+    random_offset: bool = False    # True 则从名字内部随机起点切片（更像 LM）
+    batch_size: int = 1            # 结构预留；当前实现仍是逐样本累加（非向量化）
+
+
+cfg = Config()
+
+
+# -------------------------
+# 数据与分词器（Tokenizer）
+# -------------------------
+def load_docs(path: str, fallback_url: str) -> List[str]:
+    """Load and shuffle documents, downloading if needed.
+    - 如果本地文件不存在，会从 fallback_url 下载（方便复现 karpathy 的名字数据集）
+    - 返回去掉空行并随机洗牌后的文档列表
+    """
+    if not os.path.exists(path):
+        urllib.request.urlretrieve(fallback_url, path)
+    with open(path, "r", encoding="utf-8") as f:
+        docs = [line.strip() for line in f if line.strip()]
+    random.shuffle(docs)
+    return docs
+
+class CharTokenizer:
+    """Character-level tokenizer with BOS token:
+    - 增加一个特殊的 BOS token（begin-of-sequence），索引为 len(uchars)
+    - vocab_size = len(uchars) + 1
+    """
+    def __init__(self, docs: Sequence[str]):
+        self.uchars = sorted(set("".join(docs)))  # 按字符排序以固定顺序
+        self.BOS = len(self.uchars)               # BOS token 的 id（在字符表之后）
+        self.vocab_size = len(self.uchars) + 1
+
+    def encode(self, s: str) -> List[int]:
+        # 将字符串每个字符映射为对应索引（不包含 BOS）
+        return [self.uchars.index(c) for c in s]
+
+    def encode_with_bos(self, doc: str) -> List[int]:
+        # 在开头/结尾各加一个 BOS（便于上下文边界处理）
+        return [self.BOS] + self.encode(doc) + [self.BOS]
+
+    def decode(self, ids: Sequence[int]) -> str:
+        # 将 id 序列转回字符串（跳过 BOS）
+        return "".join(self.uchars[i] for i in ids if i != self.BOS)
+
+# -------------------------
+# Autograd: Value（标量计算图节点）
+# -------------------------
+class Value:
+    """Scalar value with autograd (ops and backward identical to original).
+    这是一个非常简化、基于标量的 autograd 节点实现（类似 micrograd 的 Value）。
+    每个 Value 保存：
+      - data: 标量数值（float）
+      - grad: 反向传播累积的梯度（float）
+      - _children: 参与计算构成当前节点的子节点（tuple/list）
+      - _local_grads: 对应于子节点的局部梯度比例（用于链式累乘）
+    注意：这里采用了纯 Python 的对象组合方式，便于教学与可解释性，但性能远不及向量化框架。
+    """
+    __slots__ = ("data", "grad", "_children", "_local_grads")
+
+    def __init__(self, data: float, children=(), local_grads=()):
+        self.data = data
+        self.grad = 0.0
+        self._children = children
+        self._local_grads = local_grads
+
+    # 运算符重载：保证与常量混合时也能构建 Value 节点
+    def __add__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        # 对于 z = x + y，局部梯度对 x 和 y 都是 1
+        return Value(self.data + other.data, (self, other), (1, 1))
+
+    def __mul__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        # z = x * y -> dz/dx = y, dz/dy = x
+        return Value(self.data * other.data, (self, other), (other.data, self.data))
+
+    def __pow__(self, other):
+        # 支持 x ** c（c 为常数）
+        return Value(self.data ** other, (self,), (other * self.data ** (other - 1),))
+
+    def log(self):
+        # 自然对数
+        return Value(math.log(self.data), (self,), (1 / self.data,))
+
+    def exp(self):
+        # 指数
+        e = math.exp(self.data)
+        return Value(e, (self,), (e,))
+
+    def relu(self):
+        # ReLU 激活：梯度为 1（x>0）或 0（x<=0）
+        return Value(max(0, self.data), (self,), (float(self.data > 0),))
+
+    # 其他便捷算符（反向调用、取负、除法等）
+    def __neg__(self): return self * -1
+    def __radd__(self, other): return self + other
+    def __sub__(self, other): return self + (-other)
+    def __rsub__(self, other): return other + (-self)
+    def __rmul__(self, other): return self * other
+    def __truediv__(self, other): return self * other ** -1
+    def __rtruediv__(self, other): return other * self ** -1
+
+    def backward(self):
+        """
+        Optimized iterative backward pass (topological ordering + backpropagation).
+
+        说明/优化点：
+        - 构建拓扑序采用非递归栈（node_stack / flag_stack）避免递归深度问题
+        - 使用 id() 作为 visited 标识，避免依赖对象的 hash/eq
+        - 在反向传播时，先从当前节点 self.grad = 1.0 开始累积（标量损失）
+        - 对于大部分节点 grad = 0 的情况做短路，减少无谓的累加
+        - 使用索引循环避免产生 zip/iterator 的额外对象
+        """
+        # Build topological order (non-recursive)
+        node_stack = [self]       # 待处理节点栈（模拟递归）
+        flag_stack = [0]          # 同步标志：0 = 首次访问，1 = 展开后再次访问以加入 topo
+        visited_ids = set()       # 记录已入栈或已处理的节点 id
+
+        topo = []                 # 最终拓扑顺序（后序）
+        append_node = node_stack.append
+        append_flag = flag_stack.append
+        pop_node = node_stack.pop
+        pop_flag = flag_stack.pop
+
+        while node_stack:
+            v = pop_node()
+            f = pop_flag()
+            vid = id(v)
+            if f:
+                # 第二次到达：把节点放进拓扑序
+                topo.append(v)
+                continue
+            if vid in visited_ids:
+                # 已经标记过，跳过重复入栈
+                continue
+            # 首次访问：标记，然后安排在之后再次被加入 topo
+            visited_ids.add(vid)
+            append_node(v)
+            append_flag(1)
+            # 把子节点压栈（保持原有 children 顺序），以便后序遍历
+            children = v._children
+            for c in children:
+                append_node(c)
+                append_flag(0)
+
+        # Backpropagation: traverse topo in reverse order and accumulate gradients
+        self.grad = 1.0  # 从损失对自身的导数为 1 开始传播
+
+        # 反向遍历拓扑序（等价于从损失向输入传播）
+        for v in reversed(topo):
+            gv = v.grad
+            if gv == 0.0:
+                # 常见情况：某些中间节点梯度为 0，短路可以节省计算
+                continue
+            children = v._children
+            lgs = v._local_grads
+            # 用索引循环避免创建 zip/iterator 对象（微优化）
+            for i in range(len(children)):
+                children[i].grad += lgs[i] * gv  # 链式法则：累加子节点梯度
+
+    def __repr__(self):
+        return f"Value(data={self.data:.4f}, grad={self.grad:.4f})"
+
+# -------------------------
+# 数值操作（Numeric Ops，保持原语义）
+# -------------------------
+def matrix(nout: int, nin: int, std: float = 0.08) -> Mat:
+    """Initialize weight matrix with Gaussian noise.
+    返回尺寸为 nout x nin 的矩阵，每个元素为 Value(random.gauss(0, std))
+    """
+    return [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
+
+def linear(x: Vec, w: Mat) -> Vec:
+    """Linear transformation: w @ x.
+    - x 是长度 nin 的向量（Vec），w 是 nout x nin 的矩阵（Mat）
+    - 返回长度为 nout 的 Vec，每个元素为 dot(w_row, x)
+    - 注意：这里所有乘加都是 Value 对象上的算子，保留自动微分信息
+    """
+    return [sum(wi * xi for wi, xi in zip(wo, x)) for wo in w]
+
+def softmax(logits: Sequence[Value]) -> Vec:
+    """Numerically stable softmax.
+    - logits: 序列 of Value（未经归一化的得分）
+    - 为了数值稳定性，先减去最大值再做 exp
+    - 返回概率向量（和值为 1，每个元素为 Value）
+    """
+    logits = list(logits)
+    max_val = max(v.data for v in logits)
+    exps = [(v - max_val).exp() for v in logits]
+    total = sum(exps)
+    return [e / total for e in exps]
+
+def rmsnorm(x: Vec) -> Vec:
+    """RMS normalization.
+    - 计算 x 的均方根 (root mean square) 并归一化：x * (ms + eps)^{-1/2}
+    - 这里没有可学习的 scale/shift，简化版的 RMSNorm
+    """
+    ms = sum(xi * xi for xi in x) / len(x)
+    scale = (ms + 1e-5) ** -0.5
+    return [xi * scale for xi in x]
+
+
+# -------------------------
+# KV Cache（用于自回归 attention 的 key/value 缓存）
+# -------------------------
+class KVCache:
+    """Manages key-value cache for autoregressive attention.
+    - 每一层维护已生成序列的 keys 和 values（分别是列表，其中每个元素为 Vec）
+    - 设计为按层索引访问，便于在生成过程中逐步 append 新的 k/v
+    """
+    def __init__(self, n_layer: int):
+        self.keys: List[List[Vec]] = [[] for _ in range(n_layer)]
+        self.values: List[List[Vec]] = [[] for _ in range(n_layer)]
+
+    def append(self, layer_idx: int, k: Vec, v: Vec):
+        """Append key and value for a layer.
+        - layer_idx: 第几层
+        - k, v: 当前 timestep 计算得到的 key 向量与 value 向量（长度 = n_embd）
+        """
+        self.keys[layer_idx].append(k)
+        self.values[layer_idx].append(v)
+
+    def get_keys(self, layer_idx: int) -> List[Vec]:
+        return self.keys[layer_idx]
+
+    def get_values(self, layer_idx: int) -> List[Vec]:
+        return self.values[layer_idx]
+
+    def reset(self):
+        """Clear all cached keys and values."""
+        for layer_keys, layer_values in zip(self.keys, self.values):
+            layer_keys.clear()
+            layer_values.clear()
+
+# -------------------------
+# Model Components（Transformer 层与模型定义）
+# -------------------------
+class Layer:
+    """Transformer layer with attention and MLP.
+    - 本实现把 attention 的线性投影以及 mlp 的两个全连接都用 matrix() 初始化
+    - 注意：这里的 matrix 返回的是 Value 对象组成的矩阵，每个元素可参与 autodiff
+    """
+    def __init__(self, n_embd: int):
+        # attention 的 projection 矩阵（wq, wk, wv, wo），均为 n_embd x n_embd
+        self.attn_wq = matrix(n_embd, n_embd)
+        self.attn_wk = matrix(n_embd, n_embd)
+        self.attn_wv = matrix(n_embd, n_embd)
+        self.attn_wo = matrix(n_embd, n_embd)
+        # MLP 两层：扩展到 4 * n_embd 再回到 n_embd（像 GPT 里的常见结构）
+        self.mlp_fc1 = matrix(4 * n_embd, n_embd)
+        self.mlp_fc2 = matrix(n_embd, 4 * n_embd)
+
+    @property
+    def params(self) -> List[Value]:
+        """Flatten all parameters in stable order.
+        - 确保参数顺序固定，便于 optimizer 与 state_dict 等的一致性
+        """
+        mats = [self.attn_wq, self.attn_wk, self.attn_wv, self.attn_wo, self.mlp_fc1, self.mlp_fc2]
+        return [p for mat in mats for row in mat for p in row]
+
+class MicroGPT:
+    """MicroGPT model (numerical flow unchanged except more vectorized attention).
+    - 这是一个极小的 GPT-like 模型，仅用于教学/实验（没有 batch 维度，所有计算用标量 Value）
+    - 关键变化是对 multi-head attention 在 Python 层面做更少的切片操作来提升速度
+    """
+    def __init__(self, vocab_size: int, n_layer: int, n_embd: int, block_size: int, n_head: int):
+        self.vocab_size = vocab_size
+        self.n_layer = n_layer
+        self.n_embd = n_embd
+        self.block_size = block_size
+        self.n_head = n_head
+        # 每个 head 的维度（head_dim * n_head == n_embd）
+        self.head_dim = n_embd // n_head
+
+        # embeddings：token embedding、positional embedding、和最终 lm_head（用于生成 logits）
+        self.wte = matrix(vocab_size, n_embd)   # token embedding table: vocab_size x n_embd
+        self.wpe = matrix(block_size, n_embd)   # positional embedding: block_size x n_embd
+        self.lm_head = matrix(vocab_size, n_embd)  # lm head: vocab_size x n_embd
+        self.layers = [Layer(n_embd) for _ in range(n_layer)]  # Transformer 层列表
+
+    @property
+    def params(self) -> List[Value]:
+        """All trainable parameters in stable order.
+        - 顺序: embeddings 然后每层的 params，保证一致性以便 optimizer 管理状态
+        """
+        emb_params = [p for mat in [self.wte, self.wpe, self.lm_head] for row in mat for p in row]
+        layer_params = [p for layer in self.layers for p in layer.params]
+        return emb_params + layer_params
+
+    def forward(self, token_id: int, pos_id: int, cache: KVCache) -> Vec:
+        """Single forward step (returns logits).
+        - 该 forward 对单个 timestep（token_id, pos_id）进行计算，使用 cache 存储之前 timesteps 的 k/v。
+        - 返回 logits：长度为 vocab_size 的 Vec（每项是 Value）。
+        主要步骤：
+         1) token embedding + pos embedding -> x
+         2) 对每层做 layernorm(rmsnorm) -> attention -> mlp
+         3) 最终用 lm_head 线性投影得到 logits
+        """
+        # embedding + positional
+        tok_emb = self.wte[token_id]   # 从 wte 中取出对应 token 的 embedding（Vec，长度 n_embd）
+        pos_emb = self.wpe[pos_id]     # 从 wpe 中取出对应位置的 embedding（Vec，长度 n_embd）
+        x = [t + p for t, p in zip(tok_emb, pos_emb)]  # elementwise add：embedding + pos_emb
+        x = rmsnorm(x)  # 先做一次 RMSNorm（类似 pre-norm）
+
+        for li, layer in enumerate(self.layers):
+            # attention block
+            x_res = x  # residual connection 残差分支
+            x = rmsnorm(x)  # layer 的输入先做 rmsnorm（pre-norm）
+            # q, k, v 投影（线性映射）：每个结果都是长度 n_embd 的 Vec
+            q = linear(x, layer.attn_wq)
+            k = linear(x, layer.attn_wk)
+            v = linear(x, layer.attn_wv)
+            # 将当前 timestep 的 k, v 追加到 cache（用于自回归 attention）
+            cache.append(li, k, v)
+
+            # ---------- multi-head attention（在 Python 层做更向量化的处理） ----------
+            # 把该层已经缓存的序列 keys/values 取出来（列表，长度等于已生成的 timesteps）
+            seq_keys = cache.get_keys(li)
+            seq_vals = cache.get_values(li)
+            seq_len = len(seq_keys)  # 当前序列长度（包含本 timestep）
+            sqrt_d = self.head_dim ** 0.5  # 缩放因子 sqrt(head_dim)（用于 attention logits 缩放）
+
+            # 预先将 queries 按 head 切分，避免在循环里重复切片 q
+            # q_heads 是长度 n_head 的列表，每项是长度 head_dim 的 Vec（Value 列表）
+            q_heads = [q[h * self.head_dim:(h + 1) * self.head_dim] for h in range(self.n_head)]
+
+            x_attn: Vec = []  # 最终拼接所有 head 的输出（长度 n_embd）
+            # 对每个 head 单独计算注意力（因为每个 head 使用不同的切片）
+            for h, q_h in enumerate(q_heads):
+                hs = h * self.head_dim
+                # 为当前 head，从每个 timestep 的 k、v 中切出 head 对应的部分（只切一次）
+                k_h = [k_vec[hs:hs + self.head_dim] for k_vec in seq_keys]  # seq_len x head_dim
+                v_h = [v_vec[hs:hs + self.head_dim] for v_vec in seq_vals]  # seq_len x head_dim
+
+                # 计算 attention logits：对每个时间步 t，计算 q_h · k_h[t]，并做缩放 1/sqrt_d
+                attn_logits = [sum(qj * ktj for qj, ktj in zip(q_h, k_t)) / sqrt_d for k_t in k_h]
+                # 把 logits 转成权重（softmax），返回的是 Value 列表（和为 1）
+                attn_weights = softmax(attn_logits)
+
+                # 使用 attention 权重对对应的 v_h 做加权求和，得到 head 的输出（长度 head_dim）
+                head_out: Vec = []
+                for j in range(self.head_dim):
+                    # 对 head 中每个维度 j 做加权和（对 seq_len 个 timestep）
+                    s = Value(0.0)
+                    for t in range(seq_len):
+                        # 每项都是 attn_weights[t]（Value） * v_h[t][j]（Value）
+                        s = s + attn_weights[t] * v_h[t][j]
+                    head_out.append(s)
+                # 将该 head 的输出拼接到 x_attn（最终长度会是 n_embd）
+                x_attn.extend(head_out)
+
+            # 把多头拼起来的输出通过 attn_wo（线性层）映射回 n_embd，然后和 residual 相加
+            x = linear(x_attn, layer.attn_wo)
+            x = [a + b for a, b in zip(x, x_res)]
+
+            # ---------- MLP block ----------
+            x_res = x
+            x = rmsnorm(x)
+            x = linear(x, layer.mlp_fc1)           # 投影到 4 * n_embd
+            x = [xi.relu() for xi in x]            # 非线性 ReLU
+            x = linear(x, layer.mlp_fc2)           # 投影回 n_embd
+            x = [a + b for a, b in zip(x, x_res)]  # 残差连接
+
+        logits = linear(x, self.lm_head)
+        return logits
+
+    # ----------- 事前调整：序列级 API（外部不再逐 timestep 调 forward）-----------
+    def forward_seq(self, x_ids: Sequence[int]) -> List[Vec]:
+        """
+        输入：长度 T 的 token ids
+        输出：长度 T 的 logits_seq，其中 logits_seq[t] 是 vocab_size 的 Vec[Value]
+        说明：内部仍逐 timestep 调现有 forward，但 Trainer 不再知道这些细节，
+              将来替换为真正的张量化实现时，只需要改这里的内部实现。
+        """
+        cache = KVCache(self.n_layer)
+        logits_seq: List[Vec] = []
+        T = len(x_ids)
+        # 位置编码长度受 block_size 限制
+        if T > self.block_size:
+            raise ValueError(f"Sequence length {T} exceeds block_size {self.block_size}")
+        for pos_id in range(T):
+            logits = self.forward(int(x_ids[pos_id]), pos_id, cache)
+            logits_seq.append(logits)
+        return logits_seq
+
+
+# -------------------------
+# 优化器（Adam）
+# -------------------------
+class Adam:
+    """Adam optimizer (math unchanged).
+    - 这是一个针对 List[Value] 的简单 Adam 实现（参数顺序与 model.params 对齐）
+    - 内部维护 m, v 两个动量数组和 step_idx
+    - step 方法会直接修改每个参数 p.data 并清零 p.grad
+    """
+    def __init__(self, params: List[Value], lr: float, beta1: float, beta2: float, eps: float):
+        self.params = params
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.m = [0.0] * len(params)  # 一阶矩估计（标量列表）
+        self.v = [0.0] * len(params)  # 二阶矩估计（标量列表）
+        self.step_idx = 0
+
+    def step(self, lr_scale: float = 1.0):
+        """Perform one optimization step with optional lr scaling.
+        - lr_scale 常用于线性 learning rate decay（示例中为 1 - step/num_steps）
+        - 注意：这里 m, v 存储的是 Python float，与参数的 Value.grad 对应读取
+        """
+        self.step_idx += 1
+        lr_t = self.lr * lr_scale
+        for i, p in enumerate(self.params):
+            # EMA 更新
+            self.m[i] = self.beta1 * self.m[i] + (1 - self.beta1) * p.grad
+            self.v[i] = self.beta2 * self.v[i] + (1 - self.beta2) * (p.grad ** 2)
+            # 偏差校正
+            m_hat = self.m[i] / (1 - self.beta1 ** self.step_idx)
+            v_hat = self.v[i] / (1 - self.beta2 ** self.step_idx)
+            # 参数更新（直接修改 p.data），加入数值稳定项 eps
+            p.data -= lr_t * m_hat / (v_hat ** 0.5 + self.eps)
+            # 清零 p.grad 为下一步准备
+            p.grad = 0.0
+
+
+# -------------------------
+# 事前调整：Sampler / 序列 loss
+# -------------------------
+class NameSampler:
+    """
+    针对 names.txt（一行一个名字）的采样器：
+    - 输入：预编码后的 encoded_docs（每个元素是 [BOS] + name + [BOS]）
+    - 输出：一条训练样本 (x_seq, y_seq)，长度 T<=block_size
+    """
+    def __init__(self, encoded_docs: Sequence[Sequence[int]], block_size: int, random_offset: bool = False):
+        self.encoded_docs = list(encoded_docs)
+        self.block_size = int(block_size)
+        self.random_offset = bool(random_offset)
+        self._idx = 0  # 用于可复现的轮转取样（与原版 step%len(docs) 类似）
+
+    def next_one(self) -> Tuple[List[int], List[int]]:
+        tokens = self.encoded_docs[self._idx]
+        self._idx = (self._idx + 1) % len(self.encoded_docs)
+
+        # 至少要有 2 个 token 才能构造 x/y
+        if len(tokens) < 2:
+            return [tokens[0]], [tokens[0]]
+
+        # 选择起点：默认 0（与“从 BOS 开始训练整行名字”一致）
+        if self.random_offset:
+            # 保证还有 target：起点最多到 len(tokens)-2
+            start = random.randint(0, len(tokens) - 2)
+        else:
+            start = 0
+
+        # 可用长度（确保 y 存在）
+        max_T = len(tokens) - 1 - start
+        T = min(self.block_size, max_T)
+        x = list(tokens[start:start + T])
+        y = list(tokens[start + 1:start + T + 1])
+        return x, y
+
+    def next_batch(self, batch_size: int) -> List[Tuple[List[int], List[int]]]:
+        return [self.next_one() for _ in range(batch_size)]
+
+
+def sequence_cross_entropy(logits_seq: Sequence[Vec], y_ids: Sequence[int]) -> Value:
+    """
+    logits_seq: 长度 T，每项是 vocab_size 的 Vec[Value]
+    y_ids:      长度 T，每项是 int target id
+    返回：平均 cross-entropy loss（Value）
+    """
+    T = len(logits_seq)
+    if T == 0:
+        return Value(0.0)
+    if len(y_ids) != T:
+        raise ValueError("y_ids length must match logits_seq length")
+
+    losses: List[Value] = []
+    for t in range(T):
+        probs = softmax(logits_seq[t])
+        losses.append(-probs[int(y_ids[t])].log())
+    return (1 / T) * sum(losses)
+
+
+# -------------------------
+# Trainer（训练循环）
+# -------------------------
+class Trainer:
+    def __init__(
+        self,
+        model: MicroGPT,
+        optimizer: Adam,
+        sampler: NameSampler,
+        cfg: Config,
+    ):
+        self.model = model
+        self.opt = optimizer
+        self.sampler = sampler
+        self.cfg = cfg
+
+    def train(self, progress_callback: Optional[Callable[[int, float], None]] = None):
+        print(f"vocab size: {self.model.vocab_size}")
+        print(f"num params: {len(self.model.params)}")
+
+        for step in range(self.cfg.num_steps):
+            batch = self.sampler.next_batch(self.cfg.batch_size)
+
+            # 结构预留：当前仍逐样本累加（不是向量化 batch）
+            batch_losses: List[Value] = []
+            for x_ids, y_ids in batch:
+                logits_seq = self.model.forward_seq(x_ids)
+                loss = sequence_cross_entropy(logits_seq, y_ids)
+                batch_losses.append(loss)
+
+            loss_total = (1 / len(batch_losses)) * sum(batch_losses)
+            loss_total.backward()
+
+            lr_scale = 1 - step / self.cfg.num_steps
+            self.opt.step(lr_scale)
+
+            if progress_callback:
+                progress_callback(step + 1, loss_total.data)
+            else:
+                # 使用 \r 覆盖行，避免大量日志
+                print(f"step {step+1:4d} / {self.cfg.num_steps:4d} | loss {loss_total.data:.4f}", end="\r")
+        print()
+
+
+# -------------------------
+# Generator（用于采样 / 推理）
+# -------------------------
+class Generator:
+    def __init__(self, model: MicroGPT, tokenizer: CharTokenizer, cfg: Config):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.cfg = cfg
+
+    def generate_one(self) -> str:
+        cache = KVCache(self.model.n_layer)
+        token_id = self.tokenizer.BOS
+        chars: List[str] = []
+
+        for pos_id in range(self.model.block_size):
+            logits = self.model.forward(token_id, pos_id, cache)
+            probs = softmax([l / self.cfg.temperature for l in logits])
+            token_id = random.choices(
+                range(self.tokenizer.vocab_size),
+                weights=[p.data for p in probs]
+            )[0]
+            if token_id == self.tokenizer.BOS:
+                break
+            chars.append(self.tokenizer.uchars[token_id])
+        return "".join(chars)
+
+    def generate(self, n_samples: int):
+        print("\n--- inference (new, hallucinated names) ---")
+        for i in range(n_samples):
+            print(f"sample {i+1:2d}: {self.generate_one()}")
+
+
+# -------------------------
+# Main
+# -------------------------
+def main():
+    docs = load_docs(cfg.input_path, cfg.fallback_url)
+    tokenizer = CharTokenizer(docs)
+
+    # 事前调整：训练前一次性预编码缓存（Trainer 不再重复 encode）
+    encoded_docs = [tokenizer.encode_with_bos(d) for d in docs]
+
+    model = MicroGPT(
+        vocab_size=tokenizer.vocab_size,
+        n_layer=cfg.n_layer,
+        n_embd=cfg.n_embd,
+        block_size=cfg.block_size,
+        n_head=cfg.n_head,
+    )
+    opt = Adam(
+        model.params,
+        lr=cfg.learning_rate,
+        beta1=cfg.beta1,
+        beta2=cfg.beta2,
+        eps=cfg.eps_adam,
+    )
+
+    sampler = NameSampler(
+        encoded_docs=encoded_docs,
+        block_size=cfg.block_size,
+        random_offset=cfg.random_offset,
+    )
+
+    trainer = Trainer(model=model, optimizer=opt, sampler=sampler, cfg=cfg)
+    trainer.train()
+
+    gen = Generator(model, tokenizer, cfg)
+    gen.generate(cfg.n_samples)
+
+if __name__ == "__main__":
+    main()

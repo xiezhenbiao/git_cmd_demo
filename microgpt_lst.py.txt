@@ -555,6 +555,9 @@ def build_backend_list():
 def build_backend_torch(device: str):
     import torch
     import torch.nn.functional as F
+    
+    torch.manual_seed(42)
+    if device.startswith("cuda"): torch.cuda.manual_seed_all(42)
 
     class NoGrad:
         def __enter__(self):

@@ -150,7 +150,10 @@ def build_backend_list():
         def __sub__(self, other): return self + (-other)
         def __radd__(self, other): return self + other
         def __rmul__(self, other): return self * other
-        def __truediv__(self, other): return self * (other ** -1)
+
+        def __truediv__(self, other): 
+            other = other if isinstance(other, Value) else Value(other)
+            return self * (other ** -1)
 
         def log(self):
             if not Value.TRACK_GRAD: return Value(math.log(self.data))
@@ -785,11 +788,13 @@ class TorchKVCachePrealloc:
     def append(self, layer_idx: int, k_new, v_new):
         # k_new, v_new: [B,H,1,Hd]
         t = self.t
+        if not (0 <= t < self.block_size): raise IndexError(f"KV cache index {t} out of range [0, {self.block_size})")
         self.k[layer_idx][:, :, t:t+1, :] = k_new
         self.v[layer_idx][:, :, t:t+1, :] = v_new
 
     def incr_t(self):
         self.t += 1
+        if not (0 <= self.t <= self.block_size): raise IndexError(f"KV cache index {self.t} out of range [0, {self.block_size})")
 
 
 class Embedding:
@@ -805,8 +810,7 @@ class Embedding:
     def forward_batch(self, idx_bt):
         if self.B["kind"]=="list":
             return self.B["Tensor"].gather_rows_batch(self.weight, idx_bt)
-        torch=self.B["torch"]
-        return torch.embedding(self.weight.data, idx_bt)
+        return self.weight.data[idx_bt]
 
     def state_dict(self):
         if self.B["kind"]=="torch":
@@ -1387,6 +1391,9 @@ def main():
         ckpt = load_ckpt(cfg.ckpt_path)
         start_step = int(ckpt.get("step", 0))
         tok = CharTokenizer.load_state_dict(ckpt["tokenizer"])
+        encoded = [tok.encode_with_bos(d) for d in docs]
+        sampler = NameSampler(encoded, cfg.block_size, cfg.random_offset)
+        
         model = MicroGPT(B, tok.vocab_size, cfg.n_layer, cfg.n_embd, cfg.block_size, cfg.n_head)
         model.load_state_dict(ckpt["model"])
         named_params = list(model.named_parameters())

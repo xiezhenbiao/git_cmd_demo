@@ -1,1459 +1,1224 @@
-# microgpt_switch_backend_single_v6_full_kv_torch_prealloc.py
-# v6 full (integrated, torch KV cache preallocated):
-# - list backend: true batch matrixized training attention ([B,H,T,T]) with micrograd Values
-# - list backend: KV-cache step-by-step sampling
-# - torch backend: matrixized training
-# - torch backend: KV-cache batch sampling with PREALLOCATED cache (no torch.cat per step)
-# - ckpt: model weights + unified Adam state keyed by stable param names; list<->torch resume interop
-
-import os, math, random, argparse, urllib.request, pickle
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, Iterator, List, Sequence, Tuple
+# microgpt_evolved.py
+# Single-file, zero-dependency (stdlib only) GPT training + inference in pure Python.
+# Standard libs allowed: math/random/os/array/multiprocessing
+import os, math, random
+from array import array
+from multiprocessing import Process, Queue
 
 random.seed(42)
 
-# ============================================================
-# Config
-# ============================================================
-@dataclass
+# ===================== SECTION: Config =====================
+
 class Config:
-    input_path: str = "input.txt"
-    fallback_url: str = "https://raw.githubusercontent.com/karpathy/makemore/988aa59/names.txt"
-
-    n_layer: int = 2
-    n_embd: int = 64
-    block_size: int = 32
-    n_head: int = 4
-
-    num_steps: int = 2000
-    batch_size: int = 32
-    learning_rate: float = 3e-3
-
-    beta1: float = 0.9
-    beta2: float = 0.99
-    eps_adam: float = 1e-8
-    warmup_steps: int = 100
-    grad_clip_norm: float = 1.0
-
-    temperature: float = 0.8
-    top_k: int = 0
-    top_p: float = 0.0
-    n_samples: int = 10
-
-    random_offset: bool = True
-
-    ckpt_path: str = "microgpt_switch_backend_v6_full_kv_torch_prealloc_ckpt.pkl"
-    save_every: int = 0
-
-
-# ============================================================
-# Data + Tokenizer
-# ============================================================
-def load_docs(path: str, fallback_url: str) -> List[str]:
-    if not os.path.exists(path):
-        urllib.request.urlretrieve(fallback_url, path)
-    with open(path, "r", encoding="utf-8") as f:
-        docs = [line.strip() for line in f if line.strip()]
-    random.shuffle(docs)
-    return docs
-
-
-class CharTokenizer:
-    def __init__(self, docs: Sequence[str]):
-        self.uchars = sorted(set("".join(docs)))
-        self.BOS = len(self.uchars)
-        self.vocab_size = len(self.uchars) + 1
-        self.stoi = {c: i for i, c in enumerate(self.uchars)}
-
-    def encode(self, s: str) -> List[int]:
-        return [self.stoi[c] for c in s]
-
-    def encode_with_bos(self, doc: str) -> List[int]:
-        return [self.BOS] + self.encode(doc) + [self.BOS]
-
-    def state_dict(self) -> Dict[str, Any]:
-        return {"uchars": self.uchars}
-
-    @classmethod
-    def load_state_dict(cls, state: Dict[str, Any]) -> "CharTokenizer":
-        obj = cls.__new__(cls)
-        obj.uchars = list(state["uchars"])
-        obj.BOS = len(obj.uchars)
-        obj.vocab_size = len(obj.uchars) + 1
-        obj.stoi = {c: i for i, c in enumerate(obj.uchars)}
-        return obj
-
-
-class NameSampler:
-    def __init__(self, encoded_docs: Sequence[Sequence[int]], block_size: int, random_offset: bool = False):
-        self.encoded_docs = list(encoded_docs)
-        self.block_size = int(block_size)
-        self.random_offset = bool(random_offset)
-        self._idx = 0
-
-    def next_one(self) -> Tuple[List[int], List[int]]:
-        tokens = self.encoded_docs[self._idx]
-        self._idx = (self._idx + 1) % len(self.encoded_docs)
-        if len(tokens) < 2:
-            return [tokens[0]], [tokens[0]]
-        start = random.randint(0, len(tokens) - 2) if self.random_offset else 0
-        max_T = len(tokens) - 1 - start
-        T = min(self.block_size, max_T)
-        x = list(tokens[start : start + T])
-        y = list(tokens[start + 1 : start + T + 1])
-        return x, y
-
-    def next_batch(self, batch_size: int) -> Tuple[List[List[int]], List[List[int]]]:
-        xs, ys = [], []
-        for _ in range(batch_size):
-            x, y = self.next_one()
-            xs.append(x); ys.append(y)
-        T = min(len(x) for x in xs)
-        xs = [x[:T] for x in xs]
-        ys = [y[:T] for y in ys]
-        return xs, ys
-
-
-# ============================================================
-# Backend: list (micrograd) with batch ops
-# ============================================================
-def build_backend_list():
-    class Value:
-        __slots__ = ("data", "grad", "_children", "_local_grads")
-        TRACK_GRAD = True
-
-        def __init__(self, data: float, children=(), local_grads=()):
-            self.data = float(data)
-            self.grad = 0.0
-            if Value.TRACK_GRAD and children:
-                self._children = children
-                self._local_grads = local_grads
-            else:
-                self._children = ()
-                self._local_grads = ()
-
-        def __add__(self, other):
-            other = other if isinstance(other, Value) else Value(other)
-            if not Value.TRACK_GRAD: return Value(self.data + other.data)
-            return Value(self.data + other.data, (self, other), (1, 1))
-
-        def __mul__(self, other):
-            other = other if isinstance(other, Value) else Value(other)
-            if not Value.TRACK_GRAD: return Value(self.data * other.data)
-            return Value(self.data * other.data, (self, other), (other.data, self.data))
-
-        def __pow__(self, other: float):
-            if not Value.TRACK_GRAD: return Value(self.data**other)
-            return Value(self.data**other, (self,), (other * self.data ** (other - 1),))
-
-        def __neg__(self): return self * -1
-        def __sub__(self, other): return self + (-other)
-        def __radd__(self, other): return self + other
-        def __rmul__(self, other): return self * other
-
-        def __truediv__(self, other): 
-            other = other if isinstance(other, Value) else Value(other)
-            return self * (other ** -1)
-
-        def log(self):
-            if not Value.TRACK_GRAD: return Value(math.log(self.data))
-            return Value(math.log(self.data), (self,), (1 / self.data,))
-
-        def exp(self):
-            e = math.exp(self.data)
-            if not Value.TRACK_GRAD: return Value(e)
-            return Value(e, (self,), (e,))
-
-        def relu(self):
-            out = max(0.0, self.data)
-            if not Value.TRACK_GRAD: return Value(out)
-            return Value(out, (self,), (float(self.data > 0),))
-
-        def backward(self):
-            if not Value.TRACK_GRAD:
-                raise RuntimeError("backward() with TRACK_GRAD=False")
-            stack, flags, topo, seen = [self], [0], [], set()
-            while stack:
-                v, f = stack.pop(), flags.pop()
-                vid = id(v)
-                if f:
-                    topo.append(v); continue
-                if vid in seen: continue
-                seen.add(vid)
-                stack.append(v); flags.append(1)
-                for c in v._children:
-                    stack.append(c); flags.append(0)
-            self.grad = 1.0
-            for v in reversed(topo):
-                gv = v.grad
-                if gv == 0.0: continue
-                for c, lg in zip(v._children, v._local_grads):
-                    c.grad += lg * gv
-
-    class NoGrad:
-        def __enter__(self):
-            self.prev = Value.TRACK_GRAD
-            Value.TRACK_GRAD = False
-        def __exit__(self, exc_type, exc, tb):
-            Value.TRACK_GRAD = self.prev
-
-    class Parameter(Value):
-        pass
-
-    def _iter_parameters(obj) -> Iterator[Parameter]:
-        if isinstance(obj, Parameter):
-            yield obj
-        elif isinstance(obj, Tensor):
-            yield from obj.parameters()
-        elif isinstance(obj, list):
-            for it in obj: yield from _iter_parameters(it)
-        elif isinstance(obj, tuple):
-            for it in obj: yield from _iter_parameters(it)
-
-    class Tensor:
-        def __init__(self, data, shape: Tuple[int, ...]):
-            self.data = data
-            self._shape = tuple(int(x) for x in shape)
-
-        @property
-        def shape(self): return self._shape
-
-        def parameters(self) -> Iterator[Parameter]:
-            yield from _iter_parameters(self.data)
-
-        @staticmethod
-        def randn(shape: Tuple[int, ...], std: float = 0.08, as_param: bool = False) -> "Tensor":
-            def make(level: int):
-                if level == len(shape) - 1:
-                    row = []
-                    for _ in range(shape[level]):
-                        v = random.gauss(0.0, std)
-                        row.append(Parameter(v) if as_param else Value(v))
-                    return row
-                return [make(level + 1) for _ in range(shape[level])]
-            return Tensor(make(0), shape)
-
-        # ---- 1D (for KV sampling)
-        def row2d(self, i: int) -> "Tensor":
-            assert len(self._shape) == 2
-            return Tensor(self.data[int(i)], (self._shape[1],))
-
-        @staticmethod
-        def from_1d(xs) -> "Tensor":
-            xs = list(xs)
-            return Tensor(xs, (len(xs),))
-
-        @staticmethod
-        def matvec(w: "Tensor", x: "Tensor") -> "Tensor":
-            O, I = w.shape
-            out=[]
-            for o in range(O):
-                s=Value(0.0)
-                for i in range(I):
-                    s = s + w.data[o][i] * x.data[i]
-                out.append(s)
-            return Tensor(out, (O,))
-
-        def softmax_1d(self) -> "Tensor":
-            m = max(v.data for v in self.data)
-            exps = [(v - m).exp() for v in self.data]
-            tot = Value(0.0)
-            for e in exps: tot = tot + e
-            return Tensor([e / tot for e in exps], self.shape)
-
-        @staticmethod
-        def rmsnorm_1d(x: "Tensor", eps: float) -> "Tensor":
-            C = x.shape[0]
-            ms = Value(0.0)
-            for j in range(C):
-                ms = ms + x.data[j]*x.data[j]
-            ms = ms / C
-            scale = (ms + eps) ** -0.5
-            return Tensor([x.data[j]*scale for j in range(C)], x.shape)
-
-        @staticmethod
-        def relu_1d(x: "Tensor") -> "Tensor":
-            return Tensor([v.relu() for v in x.data], x.shape)
-
-        @staticmethod
-        def split_heads_1d(x: "Tensor", n_head: int) -> List["Tensor"]:
-            C = x.shape[0]; Hd = C // n_head
-            return [Tensor(x.data[h*Hd:(h+1)*Hd], (Hd,)) for h in range(n_head)]
-
-        @staticmethod
-        def cat_heads_1d(heads: List["Tensor"]) -> "Tensor":
-            data=[]
-            for h in heads: data.extend(h.data)
-            return Tensor(data, (len(data),))
-
-        # ---- batch ops (training)
-        @staticmethod
-        def gather_rows_batch(weight_vc: "Tensor", idx_bt: List[List[int]]) -> "Tensor":
-            B = len(idx_bt); T = len(idx_bt[0])
-            out=[]
-            for b in range(B):
-                rows=[]
-                for t in range(T):
-                    rows.append(list(weight_vc.data[int(idx_bt[b][t])]))
-                out.append(rows)
-            return Tensor(out, (B, T, weight_vc.shape[1]))
-
-        @staticmethod
-        def add_btc(a: "Tensor", b: "Tensor") -> "Tensor":
-            B, T, C = a.shape
-            assert b.shape == (B, T, C)
-            out=[]
-            for bb in range(B):
-                rows=[]
-                for tt in range(T):
-                    rows.append([a.data[bb][tt][j] + b.data[bb][tt][j] for j in range(C)])
-                out.append(rows)
-            return Tensor(out, (B, T, C))
-
-        @staticmethod
-        def rmsnorm_btc(x: "Tensor", eps: float) -> "Tensor":
-            B, T, C = x.shape
-            out=[]
-            for bb in range(B):
-                rows=[]
-                for tt in range(T):
-                    row = x.data[bb][tt]
-                    ms = Value(0.0)
-                    for j in range(C):
-                        ms = ms + row[j]*row[j]
-                    ms = ms / C
-                    scale = (ms + eps) ** -0.5
-                    rows.append([row[j]*scale for j in range(C)])
-                out.append(rows)
-            return Tensor(out, (B, T, C))
-
-        @staticmethod
-        def mul_gamma_btc(x: "Tensor", gamma_c: "Tensor") -> "Tensor":
-            B, T, C = x.shape
-            assert gamma_c.shape == (C,)
-            out=[]
-            for bb in range(B):
-                rows=[]
-                for tt in range(T):
-                    rows.append([x.data[bb][tt][j] * gamma_c.data[j] for j in range(C)])
-                out.append(rows)
-            return Tensor(out, (B, T, C))
-
-        @staticmethod
-        def linear_btc(x_bti: "Tensor", w_oi: "Tensor") -> "Tensor":
-            B, T, I = x_bti.shape
-            O, I2 = w_oi.shape
-            assert I == I2
-            out=[]
-            for bb in range(B):
-                rows=[]
-                for tt in range(T):
-                    xrow = x_bti.data[bb][tt]
-                    yrow=[]
-                    for o in range(O):
-                        s=Value(0.0)
-                        wrow = w_oi.data[o]
-                        for i in range(I):
-                            s = s + wrow[i]*xrow[i]
-                        yrow.append(s)
-                    rows.append(yrow)
-                out.append(rows)
-            return Tensor(out, (B, T, O))
-
-        @staticmethod
-        def relu_btc(x: "Tensor") -> "Tensor":
-            B, T, C = x.shape
-            out=[]
-            for bb in range(B):
-                rows=[]
-                for tt in range(T):
-                    rows.append([x.data[bb][tt][j].relu() for j in range(C)])
-                out.append(rows)
-            return Tensor(out, (B, T, C))
-
-        @staticmethod
-        def reshape_bthd(x_btc: "Tensor", n_head: int) -> "Tensor":
-            B, T, C = x_btc.shape
-            Hd = C // n_head
-            out=[]
-            for bb in range(B):
-                hh=[]
-                for h in range(n_head):
-                    rows=[]
-                    for tt in range(T):
-                        rows.append(x_btc.data[bb][tt][h*Hd:(h+1)*Hd])
-                    hh.append(rows)
-                out.append(hh)
-            return Tensor(out, (B, n_head, T, Hd))
-
-        @staticmethod
-        def transpose_last2(x_bhtd: "Tensor") -> "Tensor":
-            B, H, T, Hd = x_bhtd.shape
-            out=[]
-            for bb in range(B):
-                hh=[]
-                for h in range(H):
-                    mat=[]
-                    for d in range(Hd):
-                        mat.append([x_bhtd.data[bb][h][t][d] for t in range(T)])
-                    hh.append(mat)
-                out.append(hh)
-            return Tensor(out, (B, H, Hd, T))
-
-        @staticmethod
-        def matmul_bhtt(a_bhtd: "Tensor", b_bhdt: "Tensor") -> "Tensor":
-            B, H, T, Hd = a_bhtd.shape
-            B2, H2, Hd2, T2 = b_bhdt.shape
-            assert (B, H, Hd, T) == (B2, H2, Hd2, T2)
-            out=[]
-            for bb in range(B):
-                hh=[]
-                for h in range(H):
-                    mat=[]
-                    for i in range(T):
-                        row=[]
-                        for j in range(T):
-                            s=Value(0.0)
-                            for d in range(Hd):
-                                s = s + a_bhtd.data[bb][h][i][d] * b_bhdt.data[bb][h][d][j]
-                            row.append(s)
-                        mat.append(row)
-                    hh.append(mat)
-                out.append(hh)
-            return Tensor(out, (B, H, T, T))
-
-        @staticmethod
-        def scale_bhtt(x: "Tensor", s: float) -> "Tensor":
-            B, H, T, T2 = x.shape
-            assert T == T2
-            out=[]
-            for bb in range(B):
-                hh=[]
-                for h in range(H):
-                    mat=[]
-                    for i in range(T):
-                        mat.append([x.data[bb][h][i][j]*s for j in range(T)])
-                    hh.append(mat)
-                out.append(hh)
-            return Tensor(out, (B, H, T, T))
-
-        @staticmethod
-        def causal_mask_bhtt(x: "Tensor", mask_value: float = -1e9) -> "Tensor":
-            B, H, T, T2 = x.shape
-            assert T == T2
-            out=[]
-            for bb in range(B):
-                hh=[]
-                for h in range(H):
-                    mat=[]
-                    for i in range(T):
-                        row=[]
-                        for j in range(T):
-                            row.append(Value(mask_value) if j > i else x.data[bb][h][i][j])
-                        mat.append(row)
-                    hh.append(mat)
-                out.append(hh)
-            return Tensor(out, (B, H, T, T))
-
-        @staticmethod
-        def softmax_last_bhtt(x: "Tensor") -> "Tensor":
-            B, H, T, T2 = x.shape
-            assert T == T2
-            out=[]
-            for bb in range(B):
-                hh=[]
-                for h in range(H):
-                    mat=[]
-                    for i in range(T):
-                        row = x.data[bb][h][i]
-                        maxv = max(v.data for v in row)
-                        exps = [(v - maxv).exp() for v in row]
-                        tot = Value(0.0)
-                        for e in exps: tot = tot + e
-                        mat.append([e/tot for e in exps])
-                    hh.append(mat)
-                out.append(hh)
-            return Tensor(out, (B, H, T, T))
-
-        @staticmethod
-        def matmul_bhtd(w_bhtt: "Tensor", v_bhtd: "Tensor") -> "Tensor":
-            B, H, T, T2 = w_bhtt.shape
-            B2, H2, T3, Hd = v_bhtd.shape
-            assert (B, H, T) == (B2, H2, T3) and T2 == T
-            out=[]
-            for bb in range(B):
-                hh=[]
-                for h in range(H):
-                    rows=[]
-                    for i in range(T):
-                        outrow=[]
-                        for d in range(Hd):
-                            s=Value(0.0)
-                            for j in range(T):
-                                s = s + w_bhtt.data[bb][h][i][j] * v_bhtd.data[bb][h][j][d]
-                            outrow.append(s)
-                        rows.append(outrow)
-                    hh.append(rows)
-                out.append(hh)
-            return Tensor(out, (B, H, T, Hd))
-
-        @staticmethod
-        def merge_heads_btc(x_bhtd: "Tensor") -> "Tensor":
-            B, H, T, Hd = x_bhtd.shape
-            out=[]
-            for bb in range(B):
-                rows=[]
-                for tt in range(T):
-                    row=[]
-                    for h in range(H):
-                        row.extend(x_bhtd.data[bb][h][tt])
-                    rows.append(row)
-                out.append(rows)
-            return Tensor(out, (B, T, H*Hd))
-
-    def clip_grad_norm(params: List[Parameter], max_norm: float) -> float:
-        if max_norm <= 0: return 0.0
-        sq = 0.0
-        for p in params:
-            sq += p.grad * p.grad
-        norm = sq ** 0.5
-        if norm > max_norm and norm > 0:
-            scale = max_norm / norm
-            for p in params:
-                p.grad *= scale
-        return norm
-
-    def pack_floats(x):
-        if isinstance(x, Parameter): return float(x.data)
-        if isinstance(x, Value): return float(x.data)
-        if isinstance(x, Tensor): return {"shape": x.shape, "data": pack_floats(x.data)}
-        if isinstance(x, list): return [pack_floats(v) for v in x]
-        return x
-
-    def unpack_tensor_like(t: Tensor, payload):
-        def assign(dst, src):
-            if isinstance(dst, list) and isinstance(src, list):
-                for d, s in zip(dst, src): assign(d, s)
-            elif isinstance(dst, Parameter):
-                dst.data = float(src)
-            elif isinstance(dst, Value):
-                dst.data = float(src)
-        assign(t.data, payload["data"])
-
-    return {
-        "kind": "list",
-        "Value": Value,
-        "NoGrad": NoGrad,
-        "Parameter": Parameter,
-        "Tensor": Tensor,
-        "clip_grad_norm": clip_grad_norm,
-        "pack_floats": pack_floats,
-        "unpack_tensor_like": unpack_tensor_like,
-    }
-
-
-# ============================================================
-# Backend: torch
-# ============================================================
-def build_backend_torch(device: str):
-    import torch
-    import torch.nn.functional as F
-    
-    torch.manual_seed(42)
-    if device.startswith("cuda"): torch.cuda.manual_seed_all(42)
-
-    class NoGrad:
-        def __enter__(self):
-            self.ctx = torch.no_grad()
-            self.ctx.__enter__()
-        def __exit__(self, exc_type, exc, tb):
-            self.ctx.__exit__(exc_type, exc, tb)
-
-    class Tensor:
-        def __init__(self, data: torch.Tensor):
-            self.data = data
-
-        @property
-        def shape(self): return tuple(self.data.shape)
-
-        @staticmethod
-        def randn(shape: Tuple[int, ...], std: float = 0.08, as_param: bool = False) -> "Tensor":
-            t = (torch.randn(*shape, device=device) * std)
-            if as_param: return Tensor(torch.nn.Parameter(t))
-            return Tensor(t)
-
-        def row(self, i: int) -> "Tensor":
-            return Tensor(self.data[i])
-
-        @staticmethod
-        def matvec(w: "Tensor", x: "Tensor") -> "Tensor":
-            return Tensor(w.data @ x.data)
-
-        def softmax_1d(self) -> "Tensor":
-            return Tensor(F.softmax(self.data, dim=-1))
-
-    def unpack_param_like(param, payload):
-        import torch
-        t = torch.tensor(payload, device=device, dtype=param.data.dtype)
-        if tuple(param.data.shape) != tuple(t.shape):
-            t = t.view_as(param.data)
-        with torch.no_grad():
-            param.data.copy_(t)
-
-    return {
-        "kind": "torch",
-        "torch": __import__("torch"),
-        "F": __import__("torch.nn.functional", fromlist=["*"]),
-        "device": device,
-        "NoGrad": NoGrad,
-        "Tensor": Tensor,
-        "unpack_param_like": unpack_param_like,
-    }
-
-
-# ============================================================
-# Adam unified (named) helper
-# ============================================================
-def _param_numel_and_flatten_kind(B, p):
-    if B["kind"] == "torch":
-        torch = B["torch"]
-        n = int(p.numel())
-        def flat(): return p.detach().float().reshape(-1).cpu().tolist()
-        def assign(xs):
-            t = torch.tensor(xs, device=B["device"], dtype=p.data.dtype).view_as(p.data)
-            with torch.no_grad():
-                p.data.copy_(t)
-        return n, "torch", flat, assign
-
-    def iter_leaf(x):
-        if hasattr(x, "grad") and hasattr(x, "data"):
-            yield x
-        elif isinstance(x, list):
-            for it in x: yield from iter_leaf(it)
-        else:
-            raise TypeError(type(x))
-    leaves = list(iter_leaf(p))
-    n = len(leaves)
-    def flat(): return [float(pp.data) for pp in leaves]
-    def assign(xs):
-        assert len(xs) == n
-        for pp, v in zip(leaves, xs):
-            pp.data = float(v)
-    return n, "list", flat, assign
-
-
-class AdamUnifiedNamedTorch:
-    def __init__(self, B, named_params, lr, beta1, beta2, eps):
-        self.B=B; self.torch=B["torch"]
-        self.lr=float(lr); self.beta1=float(beta1); self.beta2=float(beta2); self.eps=float(eps)
-        self.step_idx=0
-        self.named_params=sorted(list(named_params), key=lambda x:x[0])
-        self.m={}; self.v={}
-        for name,p in self.named_params:
-            n,_,_,_=_param_numel_and_flatten_kind(B,p)
-            self.m[name]=[0.0]*n; self.v[name]=[0.0]*n
-
-    def unified_state(self):
-        return {"kind":"adam_unified_named_v1","step":self.step_idx,"m":self.m,"v":self.v}
-
-    def load_unified_state(self,u):
-        if not u: return
-        if u.get("kind")!="adam_unified_named_v1":
-            raise ValueError(f"Unsupported opt state kind: {u.get('kind')}")
-        self.step_idx=int(u["step"])
-        um,uv=u.get("m",{}),u.get("v",{})
-        for name,p in self.named_params:
-            if name in um and name in uv:
-                n,_,_,_=_param_numel_and_flatten_kind(self.B,p)
-                if len(um[name])!=n or len(uv[name])!=n:
-                    raise ValueError(f"Adam state mismatch at {name}: expected {n}")
-                self.m[name]=list(um[name]); self.v[name]=list(uv[name])
-
-    def zero_grad(self):
-        for _,p in self.named_params:
-            p.grad=None
-
-    def step(self, lr_scale=1.0):
-        torch=self.torch
-        self.step_idx+=1
-        lr_t=self.lr*lr_scale
-        with torch.no_grad():
-            for name,p in self.named_params:
-                if p.grad is None: continue
-                g=p.grad.detach().float().reshape(-1).cpu().tolist()
-                m=self.m[name]; v=self.v[name]
-                n=len(g)
-                for i in range(n):
-                    gi=g[i]
-                    mi=m[i]=self.beta1*m[i]+(1-self.beta1)*gi
-                    vi=v[i]=self.beta2*v[i]+(1-self.beta2)*(gi*gi)
-                    m_hat=mi/(1-self.beta1**self.step_idx)
-                    v_hat=vi/(1-self.beta2**self.step_idx)
-                    g[i]=m_hat/(math.sqrt(v_hat)+self.eps)
-                upd=torch.tensor(g,device=self.B["device"],dtype=p.data.dtype).view_as(p.data)
-                p.data.add_(upd,alpha=-lr_t)
-                p.grad=None
-
-
-class AdamUnifiedNamedList:
-    def __init__(self, B, named_params, lr, beta1, beta2, eps):
-        self.B=B
-        self.lr=float(lr); self.beta1=float(beta1); self.beta2=float(beta2); self.eps=float(eps)
-        self.step_idx=0
-        self.named_params=sorted(list(named_params), key=lambda x:x[0])
-        self.m={}; self.v={}
-        for name,p in self.named_params:
-            n,_,_,_=_param_numel_and_flatten_kind(B,p)
-            self.m[name]=[0.0]*n; self.v[name]=[0.0]*n
-
-    def unified_state(self):
-        return {"kind":"adam_unified_named_v1","step":self.step_idx,"m":self.m,"v":self.v}
-
-    def load_unified_state(self,u):
-        if not u: return
-        if u.get("kind")!="adam_unified_named_v1":
-            raise ValueError(f"Unsupported opt state kind: {u.get('kind')}")
-        self.step_idx=int(u["step"])
-        um,uv=u.get("m",{}),u.get("v",{})
-        for name,p in self.named_params:
-            if name in um and name in uv:
-                n,_,_,_=_param_numel_and_flatten_kind(self.B,p)
-                if len(um[name])!=n or len(uv[name])!=n:
-                    raise ValueError(f"Adam state mismatch at {name}: expected {n}")
-                self.m[name]=list(um[name]); self.v[name]=list(uv[name])
-
-    def step(self, lr_scale=1.0):
-        self.step_idx+=1
-        lr_t=self.lr*lr_scale
-
-        def iter_leaf(x):
-            if hasattr(x,"grad") and hasattr(x,"data"):
-                yield x
-            elif isinstance(x,list):
-                for it in x: yield from iter_leaf(it)
-            else:
-                raise TypeError(type(x))
-
-        for name,root in self.named_params:
-            leaves=list(iter_leaf(root))
-            m=self.m[name]; v=self.v[name]
-            for i,leaf in enumerate(leaves):
-                g=leaf.grad
-                m[i]=self.beta1*m[i]+(1-self.beta1)*g
-                v[i]=self.beta2*v[i]+(1-self.beta2)*(g**2)
-                m_hat=m[i]/(1-self.beta1**self.step_idx)
-                v_hat=v[i]/(1-self.beta2**self.step_idx)
-                leaf.data-=lr_t*m_hat/(math.sqrt(v_hat)+self.eps)
-                leaf.grad=0.0
-
-
-# ============================================================
-# Model
-# ============================================================
-class KVCache:
-    def __init__(self, n_layer: int, n_head: int):
-        self.n_layer=int(n_layer); self.n_head=int(n_head)
-        self.keys=[[[] for _ in range(n_head)] for _ in range(n_layer)]
-        self.values=[[[] for _ in range(n_head)] for _ in range(n_layer)]
-
-    def append(self, layer_idx: int, k_heads: List[Any], v_heads: List[Any]):
-        for h in range(self.n_head):
-            self.keys[layer_idx][h].append(k_heads[h])
-            self.values[layer_idx][h].append(v_heads[h])
-
-
-class TorchKVCachePrealloc:
-    # Prealloc per layer:
-    # k[layer], v[layer]: [B,H,block_size,Hd]
-    # current length t
-    def __init__(self, torch, device: str, n_layer: int, n_head: int, head_dim: int, batch_size: int, block_size: int, dtype):
-        self.torch = torch
-        self.device = device
-        self.n_layer = int(n_layer)
-        self.n_head = int(n_head)
-        self.head_dim = int(head_dim)
-        self.batch_size = int(batch_size)
-        self.block_size = int(block_size)
-        self.dtype = dtype
-        self.t = 0
-        self.k = [
-            torch.empty((batch_size, n_head, block_size, head_dim), device=device, dtype=dtype)
-            for _ in range(n_layer)
-        ]
-        self.v = [
-            torch.empty((batch_size, n_head, block_size, head_dim), device=device, dtype=dtype)
-            for _ in range(n_layer)
-        ]
-
-    def append(self, layer_idx: int, k_new, v_new):
-        # k_new, v_new: [B,H,1,Hd]
-        t = self.t
-        if not (0 <= t < self.block_size): raise IndexError(f"KV cache index {t} out of range [0, {self.block_size})")
-        self.k[layer_idx][:, :, t:t+1, :] = k_new
-        self.v[layer_idx][:, :, t:t+1, :] = v_new
-
-    def incr_t(self):
-        self.t += 1
-        if not (0 <= self.t <= self.block_size): raise IndexError(f"KV cache index {self.t} out of range [0, {self.block_size})")
-
-
-class Embedding:
-    def __init__(self, B, num_embeddings: int, embedding_dim: int):
-        self.B=B
-        self.weight=B["Tensor"].randn((num_embeddings, embedding_dim), std=0.08, as_param=True)
-
-    def forward_1d(self, idx: int):
-        if self.B["kind"]=="list":
-            return self.weight.row2d(idx)
-        return self.weight.row(idx)
-
-    def forward_batch(self, idx_bt):
-        if self.B["kind"]=="list":
-            return self.B["Tensor"].gather_rows_batch(self.weight, idx_bt)
-        return self.weight.data[idx_bt]
-
-    def state_dict(self):
-        if self.B["kind"]=="torch":
-            return {"shape": self.weight.shape, "weight": self.weight.data.detach().float().cpu().tolist()}
-        return {"shape": self.weight.shape, "weight": self.B["pack_floats"](self.weight)}
-
-    def load_state_dict(self, sd):
-        if self.B["kind"]=="torch":
-            self.B["unpack_param_like"](self.weight.data, sd["weight"])
-        else:
-            self.B["unpack_tensor_like"](self.weight, sd["weight"])
-
-
-class Linear:
-    def __init__(self, B, in_features: int, out_features: int):
-        self.B=B
-        self.weight=B["Tensor"].randn((out_features, in_features), std=0.08, as_param=True)
-
-    def forward_1d(self, x):
-        return self.B["Tensor"].matvec(self.weight, x)
-
-    def forward_batch(self, x_bti):
-        if self.B["kind"]=="list":
-            return self.B["Tensor"].linear_btc(x_bti, self.weight)
-        return x_bti @ self.weight.data.t()
-
-    def state_dict(self):
-        if self.B["kind"]=="torch":
-            return {"shape": self.weight.shape, "weight": self.weight.data.detach().float().cpu().tolist()}
-        return {"shape": self.weight.shape, "weight": self.B["pack_floats"](self.weight)}
-
-    def load_state_dict(self, sd):
-        if self.B["kind"]=="torch":
-            self.B["unpack_param_like"](self.weight.data, sd["weight"])
-        else:
-            self.B["unpack_tensor_like"](self.weight, sd["weight"])
-
-
-class RMSNorm:
-    def __init__(self,B,n_embd,eps=1e-5):
-        self.B=B; self.eps=float(eps)
-        self.gamma=B["Tensor"].randn((n_embd,), std=0.02, as_param=True)
-
-    def forward_1d(self,x):
-        T=self.B["Tensor"]
-        y=T.rmsnorm_1d(x,self.eps)
-        return T.from_1d([y.data[i]*self.gamma.data[i] for i in range(self.gamma.shape[0])])
-
-    def forward_batch(self,x_btc):
-        if self.B["kind"]=="list":
-            T=self.B["Tensor"]
-            y=T.rmsnorm_btc(x_btc,self.eps)
-            return T.mul_gamma_btc(y,self.gamma)
-        torch=self.B["torch"]
-        ms=(x_btc*x_btc).mean(dim=-1,keepdim=True)
-        y=x_btc*torch.rsqrt(ms+self.eps)
-        return y*self.gamma.data
-
-    def state_dict(self):
-        if self.B["kind"]=="torch":
-            return {"eps": self.eps, "shape": self.gamma.shape, "gamma": self.gamma.data.detach().float().cpu().tolist()}
-        return {"eps": self.eps, "shape": self.gamma.shape, "gamma": self.B["pack_floats"](self.gamma)}
-
-    def load_state_dict(self, sd):
-        self.eps=float(sd["eps"])
-        if self.B["kind"]=="torch":
-            self.B["unpack_param_like"](self.gamma.data, sd["gamma"])
-        else:
-            self.B["unpack_tensor_like"](self.gamma, sd["gamma"])
-
-
-class CausalSelfAttention:
-    def __init__(self,B,n_embd,n_head):
-        self.B=B
-        self.n_embd=int(n_embd); self.n_head=int(n_head)
-        assert self.n_embd % self.n_head==0
-        self.head_dim=self.n_embd//self.n_head
-        self.scale=1.0/(self.head_dim**0.5)
-        self.wq=Linear(B,n_embd,n_embd)
-        self.wk=Linear(B,n_embd,n_embd)
-        self.wv=Linear(B,n_embd,n_embd)
-        self.wo=Linear(B,n_embd,n_embd)
-
-    # list generation step with KV cache
-    def forward_step_list(self,x,cache:KVCache,layer_idx:int):
-        T=self.B["Tensor"]
-        q=self.wq.forward_1d(x)
-        k=self.wk.forward_1d(x)
-        v=self.wv.forward_1d(x)
-
-        qh=T.split_heads_1d(q,self.n_head)
-        kh=T.split_heads_1d(k,self.n_head)
-        vh=T.split_heads_1d(v,self.n_head)
-        cache.append(layer_idx,kh,vh)
-
-        out_heads=[]
-        for h in range(self.n_head):
-            q_h=qh[h]
-            k_hist=cache.keys[layer_idx][h]
-            v_hist=cache.values[layer_idx][h]
-            TT=len(k_hist)
-
-            logits=[]
-            for t in range(TT):
-                s=None
-                for j in range(self.head_dim):
-                    term=q_h.data[j]*k_hist[t].data[j]
-                    s=term if s is None else (s+term)
-                logits.append(s*self.scale)
-
-            w=T.from_1d(logits).softmax_1d()
-
-            out=[]
-            for j in range(self.head_dim):
-                s=None
-                for t in range(TT):
-                    term=w.data[t]*v_hist[t].data[j]
-                    s=term if s is None else (s+term)
-                out.append(s)
-            out_heads.append(T.from_1d(out))
-
-        y=T.cat_heads_1d(out_heads)
-        return self.wo.forward_1d(y)
-
-    # torch generation step with PREALLOCATED KV cache (batch)
-    def forward_step_torch(self, x_bC, cache: TorchKVCachePrealloc, layer_idx: int):
-        torch = self.B["torch"]
-        B = x_bC.shape[0]
-        H = self.n_head
-        Hd = self.head_dim
-        t = cache.t
-
-        q = x_bC @ self.wq.weight.data.t()
-        k = x_bC @ self.wk.weight.data.t()
-        v = x_bC @ self.wv.weight.data.t()
-
-        q = q.view(B, H, 1, Hd)
-        k = k.view(B, H, 1, Hd)
-        v = v.view(B, H, 1, Hd)
-
-        cache.append(layer_idx, k, v)
-        K = cache.k[layer_idx][:, :, :t+1, :]  # [B,H,T,Hd]
-        V = cache.v[layer_idx][:, :, :t+1, :]
-
-        att = (q @ K.transpose(-2, -1)) * self.scale  # [B,H,1,T]
-        w = torch.softmax(att, dim=-1)
-        y = w @ V                                    # [B,H,1,Hd]
-        y = y.view(B, H*Hd)
-        out = y @ self.wo.weight.data.t()
+    # model
+    n_layer = 2
+    n_embd = 64
+    n_head = 4
+    block_size = 32  # Tmax for KV cache + training context
+    vocab_size = None  # set by tokenizer
+    # training
+    batch_size = 8
+    steps = 200
+    lr = 3e-3
+    beta1 = 0.9
+    beta2 = 0.95
+    eps = 1e-8
+    weight_std = 0.02
+    # misc
+    device = "py"  # "py" or "torch" (stub)
+    grad_view_policy = "A"  # "A" or "B"
+
+# ===================== SECTION: Utilities =====================
+
+def prod(xs):
+    p = 1
+    for x in xs: p *= x
+    return p
+
+def clamp(a, lo, hi):
+    return lo if a < lo else hi if a > hi else a
+
+def assert_(cond, msg="assert failed"):
+    if not cond:
+        raise AssertionError(msg)
+
+# ===================== SECTION: Tensor (pure Python, array('f')) =====================
+
+class Tensor:
+    """
+    Pure Python float32 tensor backed by array('f') with shape/strides/offset.
+    Supports view/slice/stack; non-contiguous ops will conservatively materialize contiguous() in policy A.
+    """
+    __slots__ = ("data", "shape", "strides", "offset", "requires_grad", "grad",
+                 "_base", "_is_view", "_name")
+
+    def __init__(self, data, shape, strides=None, offset=0, requires_grad=False, grad=None, base=None, is_view=False, name=""):
+        self.data = data  # array('f')
+        self.shape = tuple(shape)
+        if strides is None:
+            strides = Tensor.default_strides(self.shape)
+        self.strides = tuple(strides)
+        self.offset = int(offset)
+        self.requires_grad = bool(requires_grad)
+        self.grad = grad  # Tensor or None
+        self._base = base
+        self._is_view = is_view
+        self._name = name
+
+    @staticmethod
+    def default_strides(shape):
+        # row-major contiguous strides in elements
+        st = []
+        acc = 1
+        for s in reversed(shape):
+            st.append(acc)
+            acc *= s
+        return tuple(reversed(st))
+
+    @staticmethod
+    def zeros(shape, requires_grad=False, name=""):
+        n = prod(shape)
+        buf = array('f', [0.0]) * n
+        grad = None
+        if requires_grad:
+            gbuf = array('f', [0.0]) * n
+            grad = Tensor(gbuf, shape, requires_grad=False, name=name+".grad")
+        return Tensor(buf, shape, requires_grad=requires_grad, grad=grad, name=name)
+
+    @staticmethod
+    def randn(shape, std=0.02, requires_grad=False, name=""):
+        n = prod(shape)
+        buf = array('f', [0.0]) * n
+        for i in range(n):
+            buf[i] = random.gauss(0.0, std)
+        grad = None
+        if requires_grad:
+            gbuf = array('f', [0.0]) * n
+            grad = Tensor(gbuf, shape, requires_grad=False, name=name+".grad")
+        return Tensor(buf, shape, requires_grad=requires_grad, grad=grad, name=name)
+
+    def numel(self):
+        return prod(self.shape)
+
+    def is_contiguous(self):
+        return self.strides == Tensor.default_strides(self.shape) and self.offset == 0 and (self._base is None)
+
+    def contiguous(self):
+        if self.is_contiguous():
+            return self
+        out = Tensor.zeros(self.shape, requires_grad=self.requires_grad, name=self._name + ".contig")
+        # copy elementwise
+        it = NDIndexer(self.shape)
+        while it.next():
+            out.data[it.flat] = self.data[self._offset_index(it.idx)]
+        # NOTE: grad buffer policy: leaf params carry grad; intermediates typically not.
         return out
 
-    def forward_batch(self, x_btc, causal_mask=None):
-        if self.B["kind"]=="list":
-            T=self.B["Tensor"]
-            H=self.n_head
+    def _offset_index(self, idx):
+        # idx tuple -> underlying data index
+        o = self.offset
+        for i, s in zip(idx, self.strides):
+            o += i * s
+        return o
 
-            q=self.wq.forward_batch(x_btc)  # [B,T,C]
-            k=self.wk.forward_batch(x_btc)
-            v=self.wv.forward_batch(x_btc)
+    def view(self, new_shape):
+        # only allow view if contiguous and same numel
+        assert_(prod(new_shape) == self.numel(), "view: numel mismatch")
+        if not self.is_contiguous():
+            # policy A: materialize
+            if Config.grad_view_policy == "A":
+                return self.contiguous().view(new_shape)
+            # policy B: allow view via base (still needs correct grad mapping)
+        return Tensor(self.data, new_shape, strides=Tensor.default_strides(new_shape),
+                      offset=self.offset, requires_grad=self.requires_grad,
+                      grad=None, base=self if self._base is None else self._base,
+                      is_view=True, name=self._name + ".view")
 
-            q=T.reshape_bthd(q,H)           # [B,H,T,Hd]
-            k=T.reshape_bthd(k,H)
-            v=T.reshape_bthd(v,H)
-            kT=T.transpose_last2(k)         # [B,H,Hd,T]
-            att=T.matmul_bhtt(q,kT)         # [B,H,T,T]
-            att=T.scale_bhtt(att,self.scale)
-            att=T.causal_mask_bhtt(att,mask_value=-1e9)
-            w=T.softmax_last_bhtt(att)
-            y=T.matmul_bhtd(w,v)            # [B,H,T,Hd]
-            y=T.merge_heads_btc(y)          # [B,T,C]
-            return self.wo.forward_batch(y) # [B,T,C]
-
-        torch=self.B["torch"]
-        Bsz,T,C=x_btc.shape
-        H=self.n_head; Hd=self.head_dim
-        q=self.wq.forward_batch(x_btc)
-        k=self.wk.forward_batch(x_btc)
-        v=self.wv.forward_batch(x_btc)
-        q=q.view(Bsz,T,H,Hd).transpose(1,2)
-        k=k.view(Bsz,T,H,Hd).transpose(1,2)
-        v=v.view(Bsz,T,H,Hd).transpose(1,2)
-        att=(q@k.transpose(-2,-1))*self.scale
-        att=att.masked_fill(causal_mask==0,float("-inf"))
-        w=torch.softmax(att,dim=-1)
-        y=w@v
-        y=y.transpose(1,2).contiguous().view(Bsz,T,C)
-        return self.wo.forward_batch(y)
-
-    def state_dict(self):
-        return {"wq": self.wq.state_dict(),"wk": self.wk.state_dict(),"wv": self.wv.state_dict(),"wo": self.wo.state_dict()}
-
-    def load_state_dict(self,sd):
-        self.wq.load_state_dict(sd["wq"])
-        self.wk.load_state_dict(sd["wk"])
-        self.wv.load_state_dict(sd["wv"])
-        self.wo.load_state_dict(sd["wo"])
-
-
-class MLP:
-    def __init__(self,B,n_embd):
-        self.B=B
-        self.fc1=Linear(B,n_embd,4*n_embd)
-        self.fc2=Linear(B,4*n_embd,n_embd)
-
-    def forward_batch(self,x_btc):
-        if self.B["kind"]=="list":
-            T=self.B["Tensor"]
-            h=self.fc1.forward_batch(x_btc)
-            h=T.relu_btc(h)
-            return self.fc2.forward_batch(h)
-        torch=self.B["torch"]
-        h=self.fc1.forward_batch(x_btc)
-        h=torch.relu(h)
-        return self.fc2.forward_batch(h)
-
-    def state_dict(self):
-        return {"fc1": self.fc1.state_dict(),"fc2": self.fc2.state_dict()}
-
-    def load_state_dict(self,sd):
-        self.fc1.load_state_dict(sd["fc1"])
-        self.fc2.load_state_dict(sd["fc2"])
-
-
-class Block:
-    def __init__(self,B,n_embd,n_head):
-        self.B=B
-        self.norm1=RMSNorm(B,n_embd)
-        self.attn=CausalSelfAttention(B,n_embd,n_head)
-        self.norm2=RMSNorm(B,n_embd)
-        self.mlp=MLP(B,n_embd)
-
-    def forward_batch(self,x_btc,causal_mask=None):
-        if self.B["kind"]=="list":
-            T=self.B["Tensor"]
-            x = T.add_btc(x_btc, self.attn.forward_batch(self.norm1.forward_batch(x_btc)))
-            x = T.add_btc(x, self.mlp.forward_batch(self.norm2.forward_batch(x)))
-            return x
-        x = x_btc + self.attn.forward_batch(self.norm1.forward_batch(x_btc), causal_mask)
-        x = x + self.mlp.forward_batch(self.norm2.forward_batch(x))
-        return x
-
-    # list KV step for sampling
-    def forward_step_list(self, x, cache:KVCache, layer_idx:int):
-        T=self.B["Tensor"]
-        a = self.attn.forward_step_list(self.norm1.forward_1d(x), cache, layer_idx)
-        x = T.from_1d([x.data[i] + a.data[i] for i in range(len(x.data))])
-
-        h = self.mlp.fc1.forward_1d(self.norm2.forward_1d(x))
-        h = T.relu_1d(h)
-        m = self.mlp.fc2.forward_1d(h)
-        x = T.from_1d([x.data[i] + m.data[i] for i in range(len(x.data))])
-        return x
-
-    # torch KV step for sampling (batch) with prealloc cache
-    def forward_step_torch(self, x_bC, cache: TorchKVCachePrealloc, layer_idx: int):
-        torch = self.B["torch"]
-
-        ms = (x_bC * x_bC).mean(dim=-1, keepdim=True)
-        y = x_bC * torch.rsqrt(ms + self.norm1.eps)
-        y = y * self.norm1.gamma.data
-
-        a = self.attn.forward_step_torch(y, cache, layer_idx)
-        x_bC = x_bC + a
-
-        ms = (x_bC * x_bC).mean(dim=-1, keepdim=True)
-        y = x_bC * torch.rsqrt(ms + self.norm2.eps)
-        y = y * self.norm2.gamma.data
-
-        h = y @ self.mlp.fc1.weight.data.t()
-        h = torch.relu(h)
-        m = h @ self.mlp.fc2.weight.data.t()
-        x_bC = x_bC + m
-        return x_bC
-
-    def state_dict(self):
-        return {"norm1": self.norm1.state_dict(),"attn": self.attn.state_dict(),"norm2": self.norm2.state_dict(),"mlp": self.mlp.state_dict()}
-
-    def load_state_dict(self,sd):
-        self.norm1.load_state_dict(sd["norm1"])
-        self.attn.load_state_dict(sd["attn"])
-        self.norm2.load_state_dict(sd["norm2"])
-        self.mlp.load_state_dict(sd["mlp"])
-
-
-class MicroGPT:
-    def __init__(self,B,vocab_size,n_layer,n_embd,block_size,n_head):
-        self.B=B
-        self.vocab_size=int(vocab_size)
-        self.n_layer=int(n_layer)
-        self.n_embd=int(n_embd)
-        self.block_size=int(block_size)
-        self.n_head=int(n_head)
-
-        self.wte=Embedding(B,self.vocab_size,self.n_embd)
-        self.wpe=Embedding(B,self.block_size,self.n_embd)
-        self.blocks=[Block(B,self.n_embd,self.n_head) for _ in range(self.n_layer)]
-        self.norm_f=RMSNorm(B,self.n_embd)
-        self.lm_head=Linear(B,self.n_embd,self.vocab_size)
-
-    def named_parameters(self,prefix=""):
-        if self.B["kind"]=="torch":
-            yield (prefix+"wte.weight", self.wte.weight.data)
-            yield (prefix+"wpe.weight", self.wpe.weight.data)
-            for li,blk in enumerate(self.blocks):
-                bp=f"{prefix}blocks.{li}."
-                yield (bp+"norm1.gamma", blk.norm1.gamma.data)
-                yield (bp+"attn.wq.weight", blk.attn.wq.weight.data)
-                yield (bp+"attn.wk.weight", blk.attn.wk.weight.data)
-                yield (bp+"attn.wv.weight", blk.attn.wv.weight.data)
-                yield (bp+"attn.wo.weight", blk.attn.wo.weight.data)
-                yield (bp+"norm2.gamma", blk.norm2.gamma.data)
-                yield (bp+"mlp.fc1.weight", blk.mlp.fc1.weight.data)
-                yield (bp+"mlp.fc2.weight", blk.mlp.fc2.weight.data)
-            yield (prefix+"norm_f.gamma", self.norm_f.gamma.data)
-            yield (prefix+"lm_head.weight", self.lm_head.weight.data)
-        else:
-            yield (prefix+"wte.weight", self.wte.weight.data)
-            yield (prefix+"wpe.weight", self.wpe.weight.data)
-            for li,blk in enumerate(self.blocks):
-                bp=f"{prefix}blocks.{li}."
-                yield (bp+"norm1.gamma", blk.norm1.gamma.data)
-                yield (bp+"attn.wq.weight", blk.attn.wq.weight.data)
-                yield (bp+"attn.wk.weight", blk.attn.wk.weight.data)
-                yield (bp+"attn.wv.weight", blk.attn.wv.weight.data)
-                yield (bp+"attn.wo.weight", blk.attn.wo.weight.data)
-                yield (bp+"norm2.gamma", blk.norm2.gamma.data)
-                yield (bp+"mlp.fc1.weight", blk.mlp.fc1.weight.data)
-                yield (bp+"mlp.fc2.weight", blk.mlp.fc2.weight.data)
-            yield (prefix+"norm_f.gamma", self.norm_f.gamma.data)
-            yield (prefix+"lm_head.weight", self.lm_head.weight.data)
-
-    # list KV step (sampling)
-    def forward_step_list(self, token_id: int, pos_id: int, cache: KVCache):
-        T=self.B["Tensor"]
-        tok=self.wte.forward_1d(token_id)
-        pos=self.wpe.forward_1d(pos_id)
-        x=T.from_1d([tok.data[i]+pos.data[i] for i in range(self.n_embd)])
-        for li,blk in enumerate(self.blocks):
-            x = blk.forward_step_list(x, cache, li)
-        x = self.norm_f.forward_1d(x)
-        return self.lm_head.forward_1d(x)
-
-    # torch KV step (sampling, batch) with prealloc cache
-    def forward_step_torch(self, token_ids_b, pos_id: int, cache: TorchKVCachePrealloc):
-        torch = self.B["torch"]
-        B = token_ids_b.shape[0]
-        C = self.n_embd
-        tok = self.wte.weight.data[token_ids_b]  # [B,C]
-        pos = self.wpe.weight.data[pos_id].view(1, C).expand(B, C)
-        x = tok + pos
-
-        for li,blk in enumerate(self.blocks):
-            x = blk.forward_step_torch(x, cache, li)
-
-        ms = (x * x).mean(dim=-1, keepdim=True)
-        y = x * torch.rsqrt(ms + self.norm_f.eps)
-        y = y * self.norm_f.gamma.data
-        logits = y @ self.lm_head.weight.data.t()  # [B,V]
-        return logits
-
-    # training forward batch (both backends)
-    def forward_batch(self, x_bT: List[List[int]]):
-        if self.B["kind"]=="list":
-            Tns=self.B["Tensor"]
-            Bsz=len(x_bT); T=len(x_bT[0])
-            tok=self.wte.forward_batch(x_bT)  # [B,T,C]
-            pos_ids=[list(range(T)) for _ in range(Bsz)]
-            pos=self.wpe.forward_batch(pos_ids)  # [B,T,C]
-            h=Tns.add_btc(tok,pos)
-            for blk in self.blocks:
-                h=blk.forward_batch(h)
-            h=self.norm_f.forward_batch(h)
-            logits=self.lm_head.forward_batch(h)  # [B,T,V]
-            return {"kind":"list_logits","B":Bsz,"T":T,"V":self.vocab_size,"data":logits.data}
-
-        torch=self.B["torch"]
-        device=self.B["device"]
-        x=torch.tensor(x_bT,device=device,dtype=torch.long)
-        Bsz,T=x.shape
-        tok=self.wte.forward_batch(x)
-        pos_ids=torch.arange(T,device=device,dtype=torch.long).unsqueeze(0).expand(Bsz,T)
-        pos=self.wpe.forward_batch(pos_ids)
-        h=tok+pos
-        causal_mask=torch.tril(torch.ones(T,T,device=device,dtype=torch.bool)).view(1,1,T,T)
-        for blk in self.blocks:
-            h=blk.forward_batch(h,causal_mask)
-        h=self.norm_f.forward_batch(h)
-        logits=self.lm_head.forward_batch(h)
-        return logits
-
-    def state_dict(self):
-        return {
-            "wte": self.wte.state_dict(),
-            "wpe": self.wpe.state_dict(),
-            "blocks": [b.state_dict() for b in self.blocks],
-            "norm_f": self.norm_f.state_dict(),
-            "lm_head": self.lm_head.state_dict(),
-            "meta": {"vocab_size": self.vocab_size, "n_layer": self.n_layer, "n_embd": self.n_embd, "block_size": self.block_size, "n_head": self.n_head},
-        }
-
-    def load_state_dict(self, sd):
-        self.wte.load_state_dict(sd["wte"])
-        self.wpe.load_state_dict(sd["wpe"])
-        for b, bs in zip(self.blocks, sd["blocks"]):
-            b.load_state_dict(bs)
-        self.norm_f.load_state_dict(sd["norm_f"])
-        self.lm_head.load_state_dict(sd["lm_head"])
-
-
-# ============================================================
-# Loss / schedule / sampling
-# ============================================================
-def lr_scale_warmup_linear(step: int, total_steps: int, warmup_steps: int) -> float:
-    if total_steps <= 0: return 1.0
-    if warmup_steps > 0 and step <= warmup_steps:
-        return step / warmup_steps
-    remaining = max(0, total_steps - step)
-    denom = max(1, total_steps - warmup_steps)
-    return remaining / denom
-
-
-def loss_batch(B, logits, y_bT: List[List[int]]):
-    if B["kind"] == "torch":
-        torch = B["torch"]
-        device = B["device"]
-        y = torch.tensor(y_bT, device=device, dtype=torch.long)
-        Bsz, T, V = logits.shape
-        return torch.nn.functional.cross_entropy(logits.reshape(Bsz * T, V), y.reshape(Bsz * T), reduction="mean")
-
-    Value = B["Value"]
-    Tensor = B["Tensor"]
-    Bsz, T = logits["B"], logits["T"]
-    total = Value(0.0)
-    n = Bsz * T
-    for b in range(Bsz):
-        for t in range(T):
-            probs = Tensor.from_1d(logits["data"][b][t]).softmax_1d()
-            total = total + (-probs.data[int(y_bT[b][t])].log())
-    return (1 / n) * total
-
-
-def sample_next_token_from_probs(probs: List[float], top_k: int, top_p: float) -> int:
-    cand = list(enumerate(probs))
-    cand.sort(key=lambda x: x[1], reverse=True)
-    if top_k and top_k > 0:
-        cand = cand[:top_k]
-    if top_p and 0.0 < top_p < 1.0:
-        kept, cum = [], 0.0
-        for idx, p in cand:
-            kept.append((idx, p)); cum += p
-            if cum >= top_p: break
-        cand = kept
-    total = sum(p for _, p in cand)
-    if total <= 0: return cand[0][0]
-    weights = [p / total for _, p in cand]
-    ids = [i for i, _ in cand]
-    return random.choices(ids, weights=weights, k=1)[0]
-
-
-def sample_next_token_list(B, logits_v, temperature: float, top_k: int, top_p: float) -> int:
-    if temperature <= 0: temperature = 1e-6
-    scaled = [v / temperature for v in logits_v.data]
-    probs = B["Tensor"].from_1d(scaled).softmax_1d()
-    probs = [p.data for p in probs.data]
-    return sample_next_token_from_probs(probs, top_k, top_p)
-
-
-# ============================================================
-# Checkpoint
-# ============================================================
-def save_ckpt(path: str, step: int, cfg: Config, tok: CharTokenizer, model: MicroGPT, opt_state: dict, backend_kind: str, extra: dict):
-    ckpt = {
-        "step": int(step),
-        "cfg": asdict(cfg),
-        "backend_kind": backend_kind,
-        "tokenizer": tok.state_dict(),
-        "model": model.state_dict(),
-        "opt_unified_state": opt_state,
-        "rng_state": random.getstate(),
-        "extra": extra,
-    }
-    with open(path, "wb") as f:
-        pickle.dump(ckpt, f)
-
-
-def load_ckpt(path: str) -> dict:
-    with open(path, "rb") as f:
-        return pickle.load(f)
-
-
-# ============================================================
-# Sampling
-# ============================================================
-def generate_samples_list_kv(B, model: MicroGPT, tok: CharTokenizer, n_samples: int, temperature: float, top_k: int, top_p: float):
-    print("\n--- inference samples (list KV) ---")
-    for i in range(n_samples):
-        cache = KVCache(model.n_layer, model.n_head)
-        token_id = tok.BOS
-        out=[]
-        with B["NoGrad"]():
-            for pos_id in range(model.block_size):
-                logits_v = model.forward_step_list(token_id, pos_id, cache)  # Tensor[ V ]
-                token_id = sample_next_token_list(B, logits_v, temperature, top_k, top_p)
-                if token_id == tok.BOS:
-                    break
-                out.append(tok.uchars[token_id])
-        print(f"sample {i+1:2d}: {''.join(out)}")
-
-
-def generate_samples_torch_kv_prealloc(B, model: MicroGPT, tok: CharTokenizer, n_samples: int, temperature: float, top_k: int, top_p: float):
-    print("\n--- inference samples (torch KV batch prealloc) ---")
-    torch = B["torch"]
-    device = B["device"]
-    maxT = model.block_size
-    BOS = tok.BOS
-    H = model.n_head
-    Hd = model.n_embd // model.n_head
-
-    dtype = model.wte.weight.data.dtype
-    cache = TorchKVCachePrealloc(torch, device, model.n_layer, H, Hd, n_samples, maxT, dtype)
-
-    token_ids = torch.full((n_samples,), BOS, device=device, dtype=torch.long)
-    finished = torch.zeros((n_samples,), device=device, dtype=torch.bool)
-    outputs = [[] for _ in range(n_samples)]
-
-    with torch.no_grad():
-        for pos_id in range(maxT):
-            logits = model.forward_step_torch(token_ids, pos_id, cache)  # [B,V]
-            scaled = logits / max(temperature, 1e-6)
-            probs = torch.softmax(scaled, dim=-1).detach().cpu().tolist()
-
-            next_ids = []
-            for b in range(n_samples):
-                if finished[b].item():
-                    next_ids.append(BOS)
-                    continue
-                nid = sample_next_token_from_probs(probs[b], top_k, top_p)
-                next_ids.append(nid)
-                if nid == BOS:
-                    finished[b] = True
+    def slice(self, slices):
+        """
+        Full multi-dim slicing with step.
+        slices: list of slice/int/None, length <= ndim. None means full.
+        Returns view if possible (strided), may be non-contiguous.
+        """
+        ndim = len(self.shape)
+        sl = list(slices) + [None] * (ndim - len(slices))
+        new_shape = []
+        new_strides = []
+        new_offset = self.offset
+        for d in range(ndim):
+            s = sl[d]
+            if s is None:
+                new_shape.append(self.shape[d])
+                new_strides.append(self.strides[d])
+            elif isinstance(s, int):
+                # reduce dimension
+                i = s
+                if i < 0: i += self.shape[d]
+                assert_(0 <= i < self.shape[d], "slice: index out of range")
+                new_offset += i * self.strides[d]
+            elif isinstance(s, slice):
+                start, stop, step = s.start, s.stop, s.step
+                if step is None: step = 1
+                dim = self.shape[d]
+                if start is None: start = 0
+                if stop is None: stop = dim
+                if start < 0: start += dim
+                if stop < 0: stop += dim
+                start = clamp(start, 0, dim)
+                stop = clamp(stop, 0, dim)
+                length = 0
+                if step > 0:
+                    if stop > start:
+                        length = (stop - start + step - 1) // step
                 else:
-                    outputs[b].append(tok.uchars[nid])
+                    # negative step
+                    if stop < start:
+                        length = (start - stop + (-step) - 1) // (-step)
+                new_offset += start * self.strides[d]
+                new_shape.append(length)
+                new_strides.append(self.strides[d] * step)
+            else:
+                raise TypeError("slice: invalid spec")
+        out = Tensor(self.data, tuple(new_shape), strides=tuple(new_strides), offset=new_offset,
+                     requires_grad=self.requires_grad, grad=None,
+                     base=self if self._base is None else self._base, is_view=True, name=self._name + ".slice")
+        # policy A: materialize if requires grad and view would need grad mapping later
+        if Config.grad_view_policy == "A" and out.requires_grad and (not out.is_contiguous()):
+            return out.contiguous()
+        return out
 
-            token_ids = torch.tensor(next_ids, device=device, dtype=torch.long)
-            cache.incr_t()
-            if bool(finished.all()):
+    @staticmethod
+    def stack(tensors, dim=0, requires_grad=False, name="stack"):
+        assert_(len(tensors) > 0, "stack: empty")
+        ref = tensors[0]
+        for t in tensors:
+            assert_(t.shape == ref.shape, "stack: shapes must match")
+        ndim = len(ref.shape)
+        dim = dim if dim >= 0 else dim + (ndim + 1)
+        assert_(0 <= dim <= ndim, "stack: dim out of range")
+        out_shape = list(ref.shape)
+        out_shape.insert(dim, len(tensors))
+        out = Tensor.zeros(tuple(out_shape), requires_grad=requires_grad, name=name)
+        # copy
+        it = NDIndexer(ref.shape)
+        while it.next():
+            for i, t in enumerate(tensors):
+                out_idx = list(it.idx)
+                out_idx.insert(dim, i)
+                out.data[out._offset_index(tuple(out_idx))] = t.data[t._offset_index(it.idx)]
+        return out
+
+class NDIndexer:
+    __slots__ = ("shape", "idx", "flat", "_done")
+    def __init__(self, shape):
+        self.shape = tuple(shape)
+        self.idx = [0] * len(self.shape)
+        self.flat = -1
+        self._done = False
+
+    def next(self):
+        if self._done: return False
+        if self.flat == -1:
+            self.flat = 0
+            return True
+        # increment
+        for d in reversed(range(len(self.shape))):
+            self.idx[d] += 1
+            if self.idx[d] < self.shape[d]:
                 break
+            self.idx[d] = 0
+            if d == 0:
+                self._done = True
+                return False
+        self.flat += 1
+        return True
 
-    for i in range(n_samples):
-        print(f"sample {i+1:2d}: {''.join(outputs[i])}")
+# ===================== SECTION: Tape (non-recursive autograd) =====================
 
+class Op:
+    __slots__ = ("name", "ctx", "bwd")
+    def __init__(self, name, ctx, bwd):
+        self.name = name
+        self.ctx = ctx
+        self.bwd = bwd  # function(ctx)
 
-# ============================================================
-# Main
-# ============================================================
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--backend", choices=["list", "torch"], default="list")
-    ap.add_argument("--device", default="cpu")
-    ap.add_argument("--resume", action="store_true")
-    args = ap.parse_args()
+class Tape:
+    __slots__ = ("ops",)
+    def __init__(self):
+        self.ops = []
 
-    cfg = Config()
-    docs = load_docs(cfg.input_path, cfg.fallback_url)
-    tok = CharTokenizer(docs)
-    encoded = [tok.encode_with_bos(d) for d in docs]
-    sampler = NameSampler(encoded, cfg.block_size, cfg.random_offset)
+    def add(self, name, ctx, bwd):
+        self.ops.append(Op(name, ctx, bwd))
 
-    B = build_backend_torch(args.device) if args.backend == "torch" else build_backend_list()
-    model = MicroGPT(B, tok.vocab_size, cfg.n_layer, cfg.n_embd, cfg.block_size, cfg.n_head)
+    def backward(self, loss):
+        assert_(loss.grad is not None, "loss must have grad buffer")
+        # seed dL/dL = 1
+        loss.grad.data[0] = 1.0
+        for op in reversed(self.ops):
+            op.bwd(op.ctx)
 
-    named_params = list(model.named_parameters())
-    opt = AdamUnifiedNamedTorch(B, named_params, cfg.learning_rate, cfg.beta1, cfg.beta2, cfg.eps_adam) if B["kind"]=="torch" \
-          else AdamUnifiedNamedList(B, named_params, cfg.learning_rate, cfg.beta1, cfg.beta2, cfg.eps_adam)
+# ===================== SECTION: PyKernels (fused kernels live here) =====================
 
-    start_step = 0
-    if args.resume and os.path.exists(cfg.ckpt_path):
-        ckpt = load_ckpt(cfg.ckpt_path)
-        start_step = int(ckpt.get("step", 0))
-        tok = CharTokenizer.load_state_dict(ckpt["tokenizer"])
-        encoded = [tok.encode_with_bos(d) for d in docs]
-        sampler = NameSampler(encoded, cfg.block_size, cfg.random_offset)
-        
-        model = MicroGPT(B, tok.vocab_size, cfg.n_layer, cfg.n_embd, cfg.block_size, cfg.n_head)
-        model.load_state_dict(ckpt["model"])
-        named_params = list(model.named_parameters())
-        opt = AdamUnifiedNamedTorch(B, named_params, cfg.learning_rate, cfg.beta1, cfg.beta2, cfg.eps_adam) if B["kind"]=="torch" \
-              else AdamUnifiedNamedList(B, named_params, cfg.learning_rate, cfg.beta1, cfg.beta2, cfg.eps_adam)
-        if "rng_state" in ckpt:
-            random.setstate(ckpt["rng_state"])
-        ustate = ckpt.get("opt_unified_state")
-        if ustate:
-            opt.load_unified_state(ustate)
+class PyKernels:
 
-    print(f"\nbackend={B['kind']} device={args.device} vocab={tok.vocab_size} steps={cfg.num_steps} batch={cfg.batch_size}")
+    # ----- basic elementwise -----
+    @staticmethod
+    def add_fwd(a, b, out):
+        it = NDIndexer(out.shape)
+        while it.next():
+            out.data[it.flat] = a.data[a._offset_index(tuple(it.idx))] + b.data[b._offset_index(tuple(it.idx))]
 
-    for step0 in range(start_step, cfg.num_steps):
-        step = step0 + 1
-        x_bT, y_bT = sampler.next_batch(cfg.batch_size)
+    @staticmethod
+    def add_bwd(a, b, out):
+        # out.grad -> a.grad, b.grad
+        it = NDIndexer(out.shape)
+        while it.next():
+            go = out.grad.data[it.flat]
+            if a.grad is not None:
+                a.grad.data[a._offset_index(tuple(it.idx))] += go
+            if b.grad is not None:
+                b.grad.data[b._offset_index(tuple(it.idx))] += go
 
-        logits = model.forward_batch(x_bT)
-        loss = loss_batch(B, logits, y_bT)
+    @staticmethod
+    def relu_fwd(x, out, mask):
+        # mask: 1 if >0 else 0
+        n = out.numel()
+        for i in range(n):
+            v = x.data[x.offset + i] if x.is_contiguous() else x.data[x._offset_index(_flat_to_idx(i, x.shape))]
+            if v > 0.0:
+                out.data[i] = v
+                mask.data[i] = 1.0
+            else:
+                out.data[i] = 0.0
+                mask.data[i] = 0.0
 
-        if B["kind"] == "torch":
-            torch = B["torch"]
-            opt.zero_grad()
-            loss.backward()
-            if cfg.grad_clip_norm and cfg.grad_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_([p for _, p in named_params], cfg.grad_clip_norm)
-            lr_scale = lr_scale_warmup_linear(step, cfg.num_steps, cfg.warmup_steps)
-            opt.step(lr_scale)
-            loss_val = float(loss.detach().cpu())
-        else:
-            loss.backward()
-            if cfg.grad_clip_norm and cfg.grad_clip_norm > 0:
-                leaves=[]
-                def iter_leaf(x):
-                    if hasattr(x, "grad") and hasattr(x, "data"):
-                        yield x
-                    elif isinstance(x, list):
-                        for it in x: yield from iter_leaf(it)
-                for _, root in named_params:
-                    leaves.extend(list(iter_leaf(root)))
-                B["clip_grad_norm"](leaves, cfg.grad_clip_norm)
-            lr_scale = lr_scale_warmup_linear(step, cfg.num_steps, cfg.warmup_steps)
-            opt.step(lr_scale)
-            loss_val = loss.data
+    @staticmethod
+    def relu_bwd(x, out, mask):
+        n = out.numel()
+        for i in range(n):
+            go = out.grad.data[i]
+            gx = go * mask.data[i]
+            if x.grad is not None:
+                if x.is_contiguous():
+                    x.grad.data[x.offset + i] += gx
+                else:
+                    x.grad.data[x._offset_index(_flat_to_idx(i, x.shape))] += gx
 
-        print(f"step {step:4d}/{cfg.num_steps:4d} | loss {loss_val:.4f}", end="\r")
+    # ----- embedding -----
+    @staticmethod
+    def embedding_fwd(W, idx_bt, out):
+        # W: [V,C], idx_bt: [B,T] int list[list[int]], out: [B,T,C]
+        B, T, C = out.shape
+        for b in range(B):
+            for t in range(T):
+                wi = idx_bt[b][t]
+                woff = wi * C
+                ooff = (b*T + t) * C
+                for c in range(C):
+                    out.data[ooff + c] = W.data[woff + c]
 
-        if cfg.save_every and cfg.save_every > 0 and step % cfg.save_every == 0:
-            save_ckpt(cfg.ckpt_path, step, cfg, tok, model, opt.unified_state(), B["kind"], {"device": args.device})
+    @staticmethod
+    def embedding_bwd(W, idx_bt, out):
+        # scatter-add into W.grad
+        assert_(W.grad is not None, "W must have grad")
+        B, T, C = out.shape
+        for b in range(B):
+            for t in range(T):
+                wi = idx_bt[b][t]
+                woff = wi * C
+                ooff = (b*T + t) * C
+                for c in range(C):
+                    W.grad.data[woff + c] += out.grad.data[ooff + c]
 
-    print("\ntraining done.")
-    save_ckpt(cfg.ckpt_path, cfg.num_steps, cfg, tok, model, opt.unified_state(), B["kind"], {"device": args.device})
-    print(f"saved: {cfg.ckpt_path}")
+    # ----- linear: Y = X @ W^T -----
+    @staticmethod
+    def linear_fwd(X, W, out):
+        # X: [B,T,C], W: [O,C], out: [B,T,O]
+        B, T, C = X.shape
+        O, C2 = W.shape
+        assert_(C == C2, "linear_fwd dim mismatch")
+        for b in range(B):
+            for t in range(T):
+                xoff = (b*T + t) * C
+                yoff = (b*T + t) * O
+                for o in range(O):
+                    woff = o * C
+                    s = 0.0
+                    for c in range(C):
+                        s += X.data[xoff + c] * W.data[woff + c]
+                    out.data[yoff + o] = s
 
-    if B["kind"] == "list":
-        generate_samples_list_kv(B, model, tok, cfg.n_samples, cfg.temperature, cfg.top_k, cfg.top_p)
+    @staticmethod
+    def linear_bwd(X, W, out):
+        # dX += dY @ W, dW += dY^T @ X
+        B, T, C = X.shape
+        O, C2 = W.shape
+        assert_(C == C2, "linear_bwd dim mismatch")
+        for b in range(B):
+            for t in range(T):
+                xoff = (b*T + t) * C
+                yoff = (b*T + t) * O
+                for o in range(O):
+                    go = out.grad.data[yoff + o]
+                    woff = o * C
+                    if X.grad is not None:
+                        for c in range(C):
+                            X.grad.data[xoff + c] += go * W.data[woff + c]
+                    if W.grad is not None:
+                        for c in range(C):
+                            W.grad.data[woff + c] += go * X.data[xoff + c]
+
+    # ----- rmsnorm -----
+    @staticmethod
+    def rmsnorm_fwd(X, out, inv_rms, eps=1e-5):
+        # per (B,T) normalize across C
+        B, T, C = X.shape
+        for bt in range(B*T):
+            xoff = bt * C
+            ms = 0.0
+            for c in range(C):
+                v = X.data[xoff + c]
+                ms += v * v
+            ms /= C
+            inv = 1.0 / math.sqrt(ms + eps)
+            inv_rms.data[bt] = inv
+            for c in range(C):
+                out.data[xoff + c] = X.data[xoff + c] * inv
+
+    @staticmethod
+    def rmsnorm_bwd(X, out, inv_rms):
+        # y = x * inv, inv = (mean(x^2)+eps)^-1/2
+        # dL/dx_i = inv * g_i - (inv^3 / C) * x_i * sum_j(g_j * x_j)
+        B, T, C = X.shape
+        for bt in range(B*T):
+            xoff = bt * C
+            inv = inv_rms.data[bt]
+            inv3 = inv * inv * inv
+            dot = 0.0
+            for c in range(C):
+                dot += out.grad.data[xoff + c] * X.data[xoff + c]
+            coef = (inv3 * dot) / C
+            for c in range(C):
+                gx = inv * out.grad.data[xoff + c] - coef * X.data[xoff + c]
+                if X.grad is not None:
+                    X.grad.data[xoff + c] += gx
+
+    # ----- fused FFN: fc1 + relu + fc2 -----
+    @staticmethod
+    def ffn_fwd(X, W1, W2, out, act, mask):
+        # X:[B,T,C], W1:[4C,C], act:[B,T,4C], mask same, W2:[C,4C], out:[B,T,C]
+        PyKernels.linear_fwd(X, W1, act)
+        # relu
+        n = act.numel()
+        for i in range(n):
+            v = act.data[i]
+            if v > 0.0:
+                mask.data[i] = 1.0
+            else:
+                act.data[i] = 0.0
+                mask.data[i] = 0.0
+        PyKernels.linear_fwd(act, W2, out)
+
+    @staticmethod
+    def ffn_bwd(X, W1, W2, out, act, mask):
+        # back through fc2, relu, fc1
+        PyKernels.linear_bwd(act, W2, out)
+        # relu backward on act (act is output of relu already; mask indicates where pre-activation>0)
+        n = act.numel()
+        for i in range(n):
+            act.grad.data[i] *= mask.data[i]
+        PyKernels.linear_bwd(X, W1, act)
+
+    # ----- attention: training full-seq (scheme=2), stable softmax, workspace reuse -----
+    @staticmethod
+    def attn_train_fwd(Q, K, V, out, ws, n_head, head_dim):
+        # Q,K,V: [B,T,C], out:[B,T,C]
+        # ws fields (preallocated): logits[B,H,T,T], probs[B,H,T,T], dlogits[B,H,T,T], tmp[B,H,T,head_dim]
+        B, T, C = Q.shape
+        H = n_head
+        D = head_dim
+        scale = 1.0 / math.sqrt(D)
+
+        # compute per head
+        for b in range(B):
+            for h in range(H):
+                # logits[t, tp] = (q_t dot k_tp)*scale with causal mask
+                for t in range(T):
+                    # compute max for stable softmax with mask
+                    maxv = -1e30
+                    for tp in range(T):
+                        if tp > t:
+                            continue
+                        s = 0.0
+                        qoff = (b*T + t) * C + h*D
+                        koff = (b*T + tp) * C + h*D
+                        for i in range(D):
+                            s += Q.data[qoff + i] * K.data[koff + i]
+                        s *= scale
+                        ws.logits[b][h][t*T + tp] = s
+                        if s > maxv: maxv = s
+                    # softmax denom
+                    denom = 0.0
+                    for tp in range(T):
+                        if tp > t:
+                            ws.probs[b][h][t*T + tp] = 0.0
+                            continue
+                        e = math.exp(ws.logits[b][h][t*T + tp] - maxv)
+                        ws.probs[b][h][t*T + tp] = e
+                        denom += e
+                    invd = 1.0 / denom
+                    for tp in range(T):
+                        ws.probs[b][h][t*T + tp] *= invd
+                # weighted sum: out[b,t,h*D:(h+1)D]
+                for t in range(T):
+                    ooff = (b*T + t) * C + h*D
+                    for i in range(D):
+                        s = 0.0
+                        for tp in range(T):
+                            if tp > t: continue
+                            p = ws.probs[b][h][t*T + tp]
+                            voff = (b*T + tp) * C + h*D
+                            s += p * V.data[voff + i]
+                        out.data[ooff + i] = s
+
+    @staticmethod
+    def attn_train_bwd(Q, K, V, out, ws, n_head, head_dim):
+        # compute dV, dQ, dK using ws.probs and ws.dlogits workspace
+        B, T, C = Q.shape
+        H = n_head
+        D = head_dim
+        scale = 1.0 / math.sqrt(D)
+
+        # dV: for each tp, i: sum_t p[t,tp] * go[t,i]
+        for b in range(B):
+            for h in range(H):
+                for tp in range(T):
+                    voff = (b*T + tp) * C + h*D
+                    for i in range(D):
+                        acc = 0.0
+                        for t in range(T):
+                            if tp > t: continue
+                            p = ws.probs[b][h][t*T + tp]
+                            go = out.grad.data[(b*T + t) * C + h*D + i]
+                            acc += p * go
+                        if V.grad is not None:
+                            V.grad.data[voff + i] += acc
+
+        # dprobs = go dot V
+        # dlogits = p * (dprobs - sum(dprobs*p))
+        for b in range(B):
+            for h in range(H):
+                for t in range(T):
+                    # compute dprobs[tp]
+                    sump = 0.0
+                    for tp in range(T):
+                        if tp > t:
+                            ws.dlogits[b][h][t*T + tp] = 0.0
+                            continue
+                        # dot(go_t, v_tp)
+                        dpr = 0.0
+                        for i in range(D):
+                            go = out.grad.data[(b*T + t)*C + h*D + i]
+                            v = V.data[(b*T + tp)*C + h*D + i]
+                            dpr += go * v
+                        p = ws.probs[b][h][t*T + tp]
+                        ws.dlogits[b][h][t*T + tp] = dpr  # temporarily store dprobs
+                        sump += dpr * p
+                    for tp in range(T):
+                        if tp > t: continue
+                        dpr = ws.dlogits[b][h][t*T + tp]
+                        p = ws.probs[b][h][t*T + tp]
+                        ws.dlogits[b][h][t*T + tp] = p * (dpr - sump)  # now dlogits
+
+        # dQ += sum_tp dlogits[t,tp] * K[tp] * scale
+        # dK += sum_t dlogits[t,tp] * Q[t] * scale
+        for b in range(B):
+            for h in range(H):
+                for t in range(T):
+                    qoff = (b*T + t) * C + h*D
+                    for i in range(D):
+                        acc = 0.0
+                        for tp in range(T):
+                            if tp > t: continue
+                            dl = ws.dlogits[b][h][t*T + tp]
+                            k = K.data[(b*T + tp)*C + h*D + i]
+                            acc += dl * k
+                        if Q.grad is not None:
+                            Q.grad.data[qoff + i] += acc * scale
+                for tp in range(T):
+                    koff = (b*T + tp) * C + h*D
+                    for i in range(D):
+                        acc = 0.0
+                        for t in range(T):
+                            if tp > t: continue
+                            dl = ws.dlogits[b][h][t*T + tp]
+                            q = Q.data[(b*T + t)*C + h*D + i]
+                            acc += dl * q
+                        if K.grad is not None:
+                            K.grad.data[koff + i] += acc * scale
+
+    # ----- attention: inference step kernel with KV cache (fused softmax+weighted sum) -----
+    @staticmethod
+    def attn_step_fwd(q_bh, Kcache, Vcache, t, out_bh, tmp, Tmax, head_dim):
+        # q_bh: [H,D] contiguous buffer (array)
+        # Kcache/Vcache: layout (Tmax, H, B, D) but we will access for one b at a time: K[t',h,b,i]
+        # out_bh: [H,D] contiguous
+        # tmp: workspace logits/probs length t+1 per head (Python list reused)
+        # stable softmax + weighted sum
+        H = len(q_bh) // head_dim
+        D = head_dim
+        scale = 1.0 / math.sqrt(D)
+        for h in range(H):
+            # logits
+            maxv = -1e30
+            for tp in range(t+1):
+                s = 0.0
+                for i in range(D):
+                    s += q_bh[h*D+i] * Kcache.get(tp, h, i)
+                s *= scale
+                tmp.logits[h][tp] = s
+                if s > maxv: maxv = s
+            denom = 0.0
+            for tp in range(t+1):
+                e = math.exp(tmp.logits[h][tp] - maxv)
+                tmp.probs[h][tp] = e
+                denom += e
+            invd = 1.0 / denom
+            for tp in range(t+1):
+                tmp.probs[h][tp] *= invd
+            # weighted sum
+            for i in range(D):
+                acc = 0.0
+                for tp in range(t+1):
+                    acc += tmp.probs[h][tp] * Vcache.get(tp, h, i)
+                out_bh[h*D+i] = acc
+
+    # ----- cross entropy: fused logsoftmax + NLL -----
+    @staticmethod
+    def logsoftmax_nll_fwd(logits, targets_bt, out_loss_bt, ws):
+        # logits: [B,T,V], targets_bt: list[list[int]], out_loss_bt:[B,T]
+        B, T, V = logits.shape
+        # ws: per (B,T): max, lse
+        for b in range(B):
+            for t in range(T):
+                off = (b*T + t)*V
+                # max
+                m = -1e30
+                for v in range(V):
+                    x = logits.data[off+v]
+                    if x > m: m = x
+                # lse
+                s = 0.0
+                for v in range(V):
+                    s += math.exp(logits.data[off+v] - m)
+                lse = m + math.log(s)
+                ws.maxv[b*T+t] = m
+                ws.lse[b*T+t] = lse
+                y = targets_bt[b][t]
+                out_loss_bt.data[b*T+t] = lse - logits.data[off+y]
+
+    @staticmethod
+    def logsoftmax_nll_bwd(logits, targets_bt, out_loss_bt, ws):
+        # dlogits = softmax - onehot(target) scaled by out_loss_bt.grad (usually 1/(B*T))
+        B, T, V = logits.shape
+        for b in range(B):
+            for t in range(T):
+                g = out_loss_bt.grad.data[b*T+t]
+                off = (b*T + t)*V
+                m = ws.maxv[b*T+t]
+                lse = ws.lse[b*T+t]
+                # softmax
+                for v in range(V):
+                    p = math.exp(logits.data[off+v] - lse)  # stable
+                    if logits.grad is not None:
+                        logits.grad.data[off+v] += g * p
+                y = targets_bt[b][t]
+                if logits.grad is not None:
+                    logits.grad.data[off+y] -= g
+
+def _flat_to_idx(flat, shape):
+    idx = [0]*len(shape)
+    for d in reversed(range(len(shape))):
+        s = shape[d]
+        idx[d] = flat % s
+        flat //= s
+    return tuple(idx)
+
+# ===================== SECTION: Backend API (PyBackend + TorchBackend stub) =====================
+
+class Backend:
+    # standard ops: create tensors, fused kernels, etc.
+    def tensor_zeros(self, shape, requires_grad=False, name=""): raise NotImplementedError
+    def tensor_randn(self, shape, std=0.02, requires_grad=False, name=""): raise NotImplementedError
+
+    # ops
+    def add(self, tape, a, b, name="add"): raise NotImplementedError
+    def rmsnorm(self, tape, x, eps=1e-5, name="rmsnorm"): raise NotImplementedError
+    def linear(self, tape, x, w, name="linear"): raise NotImplementedError
+    def embedding(self, tape, W, idx_bt, name="embedding"): raise NotImplementedError
+    def ffn(self, tape, x, w1, w2, name="ffn"): raise NotImplementedError
+
+    # attention
+    def attn_train(self, tape, q, k, v, n_head, head_dim, ws, name="attn_train"): raise NotImplementedError
+
+    # cross entropy
+    def cross_entropy(self, tape, logits, targets_bt, ws, name="cross_entropy"): raise NotImplementedError
+
+class PyBackend(Backend):
+    def tensor_zeros(self, shape, requires_grad=False, name=""):
+        return Tensor.zeros(shape, requires_grad=requires_grad, name=name)
+    def tensor_randn(self, shape, std=0.02, requires_grad=False, name=""):
+        return Tensor.randn(shape, std=std, requires_grad=requires_grad, name=name)
+
+    def add(self, tape, a, b, name="add"):
+        assert_(a.shape == b.shape, "add shape mismatch")
+        out = Tensor.zeros(a.shape, requires_grad=(a.requires_grad or b.requires_grad), name=name)
+        if out.requires_grad:
+            out.grad = Tensor.zeros(out.shape, requires_grad=False, name=name+".grad")
+        PyKernels.add_fwd(a, b, out)
+        def bwd(ctx):
+            PyKernels.add_bwd(ctx["a"], ctx["b"], ctx["out"])
+        tape.add(name, {"a":a, "b":b, "out":out}, bwd)
+        return out
+
+    def linear(self, tape, x, w, name="linear"):
+        # x:[B,T,C], w:[O,C] => out:[B,T,O]
+        B,T,C = x.shape
+        O,C2 = w.shape
+        assert_(C==C2, "linear dims")
+        out = Tensor.zeros((B,T,O), requires_grad=(x.requires_grad or w.requires_grad), name=name)
+        if out.requires_grad: out.grad = Tensor.zeros(out.shape, name=name+".grad")
+        PyKernels.linear_fwd(x, w, out)
+        def bwd(ctx):
+            PyKernels.linear_bwd(ctx["x"], ctx["w"], ctx["out"])
+        tape.add(name, {"x":x, "w":w, "out":out}, bwd)
+        return out
+
+    def embedding(self, tape, W, idx_bt, name="embedding"):
+        B = len(idx_bt); T = len(idx_bt[0]); V,C = W.shape
+        out = Tensor.zeros((B,T,C), requires_grad=W.requires_grad, name=name)
+        if out.requires_grad: out.grad = Tensor.zeros(out.shape, name=name+".grad")
+        PyKernels.embedding_fwd(W, idx_bt, out)
+        def bwd(ctx):
+            PyKernels.embedding_bwd(ctx["W"], ctx["idx"], ctx["out"])
+        tape.add(name, {"W":W, "idx":idx_bt, "out":out}, bwd)
+        return out
+
+    def rmsnorm(self, tape, x, eps=1e-5, name="rmsnorm"):
+        out = Tensor.zeros(x.shape, requires_grad=x.requires_grad, name=name)
+        if out.requires_grad: out.grad = Tensor.zeros(out.shape, name=name+".grad")
+        B,T,C = x.shape
+        inv = Tensor.zeros((B*T,), requires_grad=False, name=name+".inv")
+        PyKernels.rmsnorm_fwd(x, out, inv, eps=eps)
+        def bwd(ctx):
+            PyKernels.rmsnorm_bwd(ctx["x"], ctx["out"], ctx["inv"])
+        tape.add(name, {"x":x, "out":out, "inv":inv}, bwd)
+        return out
+
+    def ffn(self, tape, x, w1, w2, name="ffn"):
+        B,T,C = x.shape
+        O1,C2 = w1.shape
+        assert_(C==C2 and O1==4*C, "ffn w1 shape")
+        O2,C3 = w2.shape
+        assert_(O2==C and C3==4*C, "ffn w2 shape")
+        out = Tensor.zeros((B,T,C), requires_grad=(x.requires_grad or w1.requires_grad or w2.requires_grad), name=name)
+        if out.requires_grad: out.grad = Tensor.zeros(out.shape, name=name+".grad")
+        act = Tensor.zeros((B,T,4*C), requires_grad=(x.requires_grad or w1.requires_grad), name=name+".act")
+        act.grad = Tensor.zeros(act.shape, name=name+".act.grad")
+        mask = Tensor.zeros((B,T,4*C), requires_grad=False, name=name+".mask")
+        PyKernels.ffn_fwd(x, w1, w2, out, act, mask)
+        def bwd(ctx):
+            PyKernels.ffn_bwd(ctx["x"], ctx["w1"], ctx["w2"], ctx["out"], ctx["act"], ctx["mask"])
+        tape.add(name, {"x":x, "w1":w1, "w2":w2, "out":out, "act":act, "mask":mask}, bwd)
+        return out
+
+    def attn_train(self, tape, q, k, v, n_head, head_dim, ws, name="attn_train"):
+        out = Tensor.zeros(q.shape, requires_grad=(q.requires_grad or k.requires_grad or v.requires_grad), name=name)
+        if out.requires_grad: out.grad = Tensor.zeros(out.shape, name=name+".grad")
+        PyKernels.attn_train_fwd(q, k, v, out, ws, n_head, head_dim)
+        def bwd(ctx):
+            PyKernels.attn_train_bwd(ctx["q"], ctx["k"], ctx["v"], ctx["out"], ctx["ws"], n_head, head_dim)
+        tape.add(name, {"q":q, "k":k, "v":v, "out":out, "ws":ws}, bwd)
+        return out
+
+    def cross_entropy(self, tape, logits, targets_bt, ws, name="cross_entropy"):
+        # logits:[B,T,V] => loss:[B,T]
+        B,T,V = logits.shape
+        loss = Tensor.zeros((B,T), requires_grad=logits.requires_grad, name=name)
+        loss.grad = Tensor.zeros((B,T), name=name+".grad")
+        PyKernels.logsoftmax_nll_fwd(logits, targets_bt, loss, ws)
+        def bwd(ctx):
+            PyKernels.logsoftmax_nll_bwd(ctx["logits"], ctx["targets"], ctx["loss"], ctx["ws"])
+        tape.add(name, {"logits":logits, "targets":targets_bt, "loss":loss, "ws":ws, "logits_ref":logits}, bwd)
+        return loss
+
+class TorchBackend(Backend):
+    """
+    Stub only. Do NOT import torch here. This defines the interface contract.
+
+    Tensor layout conventions (match PyBackend):
+      - embeddings: Wte [V,C], Wpe [Tmax,C]
+      - activations: X [B,T,C]
+      - qkv packed: [B,T,3C] or separate [B,T,C]
+      - KV cache layout: (Tmax, n_head, B, head_dim) for K and V
+    Required methods to implement (minimum):
+      tensor_zeros, tensor_randn
+      add, rmsnorm, linear, embedding, ffn, attn_train, cross_entropy
+    """
+    def __init__(self):
+        raise NotImplementedError("TorchBackend is a stub: implement with torch tensors externally.")
+
+# ===================== SECTION: Workspaces (attention/CE) =====================
+
+class AttnTrainWorkspace:
+    """
+    Structured workspace:
+      logits/probs/dlogits: [B][H] each is array('f') length T*T
+    Reused across steps; includes dirty flags.
+    """
+    __slots__ = ("B","H","T","logits","probs","dlogits","dirty")
+    def __init__(self, B, H, T):
+        self.B, self.H, self.T = B, H, T
+        self.logits = [[array('f', [0.0])*(T*T) for _ in range(H)] for _ in range(B)]
+        self.probs  = [[array('f', [0.0])*(T*T) for _ in range(H)] for _ in range(B)]
+        self.dlogits= [[array('f', [0.0])*(T*T) for _ in range(H)] for _ in range(B)]
+        self.dirty = True
+
+class CEWorkspace:
+    __slots__ = ("maxv","lse","B","T")
+    def __init__(self, B, T):
+        self.B, self.T = B, T
+        self.maxv = array('f', [0.0]) * (B*T)
+        self.lse  = array('f', [0.0]) * (B*T)
+
+# ===================== SECTION: KV Cache (preallocated) =====================
+
+class KVCache:
+    # layout: (Tmax, n_head, B, head_dim)
+    __slots__ = ("Tmax","H","B","D","K","V")
+    def __init__(self, Tmax, H, B, D):
+        self.Tmax, self.H, self.B, self.D = Tmax, H, B, D
+        self.K = array('f', [0.0]) * (Tmax*H*B*D)
+        self.V = array('f', [0.0]) * (Tmax*H*B*D)
+
+    def _idx(self, t, h, b, i):
+        # ((((t*H + h)*B + b)*D + i))
+        return (((t*self.H + h)*self.B + b)*self.D + i)
+
+    def set_kv(self, t, b, h, vec, is_k=True):
+        base = self.K if is_k else self.V
+        for i in range(self.D):
+            base[self._idx(t,h,b,i)] = vec[i]
+
+    def getK_accessor(self, b):
+        cache = self
+        class Acc:
+            __slots__ = ("b",)
+            def __init__(self, b): self.b = b
+            def get(self, t, h, i):
+                return cache.K[cache._idx(t,h,self.b,i)]
+        return Acc(b)
+
+    def getV_accessor(self, b):
+        cache = self
+        class Acc:
+            __slots__ = ("b",)
+            def __init__(self, b): self.b = b
+            def get(self, t, h, i):
+                return cache.V[cache._idx(t,h,self.b,i)]
+        return Acc(b)
+
+class AttnStepWorkspace:
+    __slots__ = ("H","Tmax","logits","probs")
+    def __init__(self, H, Tmax):
+        self.H = H
+        self.Tmax = Tmax
+        self.logits = [array('f', [0.0]) * Tmax for _ in range(H)]
+        self.probs  = [array('f', [0.0]) * Tmax for _ in range(H)]
+
+# ===================== SECTION: Model Parameters =====================
+
+class GPTParams:
+    __slots__ = ("wte","wpe","wqkv","wo","fc1","fc2","lm_head","n_layer","n_embd")
+    def __init__(self, backend, cfg: Config):
+        V = cfg.vocab_size
+        C = cfg.n_embd
+        L = cfg.n_layer
+        Tmax = cfg.block_size
+        self.n_layer = L
+        self.n_embd = C
+        self.wte = backend.tensor_randn((V,C), std=cfg.weight_std, requires_grad=True, name="wte")
+        self.wpe = backend.tensor_randn((Tmax,C), std=cfg.weight_std, requires_grad=True, name="wpe")
+        # per-layer packed qkv: [3C, C]
+        self.wqkv = [backend.tensor_randn((3*C,C), std=cfg.weight_std, requires_grad=True, name=f"layer{i}.wqkv") for i in range(L)]
+        self.wo   = [backend.tensor_randn((C,C), std=cfg.weight_std, requires_grad=True, name=f"layer{i}.wo") for i in range(L)]
+        self.fc1  = [backend.tensor_randn((4*C,C), std=cfg.weight_std, requires_grad=True, name=f"layer{i}.fc1") for i in range(L)]
+        self.fc2  = [backend.tensor_randn((C,4*C), std=cfg.weight_std, requires_grad=True, name=f"layer{i}.fc2") for i in range(L)]
+        self.lm_head = backend.tensor_randn((V,C), std=cfg.weight_std, requires_grad=True, name="lm_head")
+
+    def parameters(self):
+        ps = [self.wte, self.wpe, self.lm_head]
+        for i in range(self.n_layer):
+            ps += [self.wqkv[i], self.wo[i], self.fc1[i], self.fc2[i]]
+        return ps
+
+# ===================== SECTION: Ops (tight API, tape-recording) =====================
+
+def split_qkv(tape, x_3c, C, name="split_qkv"):
+    # x_3c: [B,T,3C] -> q,k,v: [B,T,C]
+    B,T,CC = x_3c.shape
+    assert_(CC == 3*C, "split_qkv: shape")
+    # views by slicing last dim: contiguous here because our linear output is contiguous
+    q = Tensor(x_3c.data, (B,T,C), strides=(T*CC, CC, 1), offset=x_3c.offset + 0*C,
+               requires_grad=x_3c.requires_grad, base=x_3c, is_view=True, name=name+".q")
+    k = Tensor(x_3c.data, (B,T,C), strides=(T*CC, CC, 1), offset=x_3c.offset + 1*C,
+               requires_grad=x_3c.requires_grad, base=x_3c, is_view=True, name=name+".k")
+    v = Tensor(x_3c.data, (B,T,C), strides=(T*CC, CC, 1), offset=x_3c.offset + 2*C,
+               requires_grad=x_3c.requires_grad, base=x_3c, is_view=True, name=name+".v")
+    # policy A: materialize to avoid strided grad mapping
+    if Config.grad_view_policy == "A":
+        q = q.contiguous(); k = k.contiguous(); v = v.contiguous()
     else:
-        generate_samples_torch_kv_prealloc(B, model, tok, cfg.n_samples, cfg.temperature, cfg.top_k, cfg.top_p)
-        # 想用 list KV 采样：直接 --backend list --resume 复用同一 ckpt
+        # policy B: allocate grads and map back via strided scatter-add
+        for t in (q,k,v):
+            if t.requires_grad:
+                t.grad = Tensor.zeros(t.shape, name=t._name+".grad")
+    def bwd(ctx):
+        if Config.grad_view_policy == "B":
+            # scatter-add q/k/v.grad into x_3c.grad
+            x = ctx["x"]
+            if x.grad is None:
+                x.grad = Tensor.zeros(x.shape, name=x._name+".grad")
+            _strided_scatter_add(x.grad, ctx["q"], 0*C)
+            _strided_scatter_add(x.grad, ctx["k"], 1*C)
+            _strided_scatter_add(x.grad, ctx["v"], 2*C)
+    tape.add(name, {"x":x_3c, "q":q, "k":k, "v":v, "C":C}, bwd)
+    return q,k,v
 
+def _strided_scatter_add(dst_grad_3c, src_c, offsetC):
+    # dst_grad_3c: [B,T,3C] contiguous, src_c: [B,T,C] contiguous
+    B,T,C = src_c.shape
+    CC = 3*C
+    for b in range(B):
+        for t in range(T):
+            doff = (b*T + t)*CC + offsetC
+            soff = (b*T + t)*C
+            for i in range(C):
+                dst_grad_3c.data[doff+i] += src_c.grad.data[soff+i]
+
+def mean_loss(tape, loss_bt, name="mean_loss"):
+    # loss_bt: [B,T] -> scalar [1]
+    B,T = loss_bt.shape
+    out = Tensor.zeros((1,), requires_grad=loss_bt.requires_grad, name=name)
+    out.grad = Tensor.zeros((1,), name=name+".grad")
+    s = 0.0
+    for i in range(B*T):
+        s += loss_bt.data[i]
+    out.data[0] = s / (B*T)
+    def bwd(ctx):
+        g = ctx["out"].grad.data[0] / (B*T)
+        if ctx["loss"].grad is None:
+            ctx["loss"].grad = Tensor.zeros(ctx["loss"].shape, name=ctx["loss"]._name+".grad")
+        for i in range(B*T):
+            ctx["loss"].grad.data[i] += g
+    tape.add(name, {"loss":loss_bt, "out":out}, bwd)
+    return out
+
+# ===================== SECTION: GPT Forward (train full-seq) =====================
+
+def gpt_forward_train(backend, params: GPTParams, idx_bt, tgt_bt, cfg: Config,
+                      attn_ws_by_layer, ce_ws):
+    tape = Tape()
+    B = len(idx_bt); T = len(idx_bt[0]); C = cfg.n_embd
+    H = cfg.n_head; D = C // H
+
+    # token + pos embeddings
+    tok = backend.embedding(tape, params.wte, idx_bt, name="tok_emb")  # [B,T,C]
+    # pos embedding gather: build idx for positions
+    pos_idx = [list(range(T)) for _ in range(B)]
+    pos = backend.embedding(tape, params.wpe, pos_idx, name="pos_emb")
+    x = backend.add(tape, tok, pos, name="x_in")
+
+    for li in range(cfg.n_layer):
+        # attn block
+        x_res = x
+        x = backend.rmsnorm(tape, x, name=f"layer{li}.rms1")
+        qkv = backend.linear(tape, x, params.wqkv[li], name=f"layer{li}.qkv")  # [B,T,3C]
+        q,k,v = split_qkv(tape, qkv, C, name=f"layer{li}.splitqkv")
+        attn = backend.attn_train(tape, q, k, v, H, D, attn_ws_by_layer[li], name=f"layer{li}.attn")
+        attn = backend.linear(tape, attn, params.wo[li], name=f"layer{li}.wo")
+        x = backend.add(tape, attn, x_res, name=f"layer{li}.res1")
+
+        # ffn block
+        x_res = x
+        x = backend.rmsnorm(tape, x, name=f"layer{li}.rms2")
+        x = backend.ffn(tape, x, params.fc1[li], params.fc2[li], name=f"layer{li}.ffn")
+        x = backend.add(tape, x, x_res, name=f"layer{li}.res2")
+
+    logits = backend.linear(tape, x, params.lm_head, name="lm_head")  # [B,T,V]
+    loss_bt = backend.cross_entropy(tape, logits, tgt_bt, ce_ws, name="ce")
+    loss = mean_loss(tape, loss_bt, name="loss_mean")
+    return tape, loss
+
+# ===================== SECTION: Optimizer (Adam, preallocated) =====================
+
+class Adam:
+    __slots__ = ("params","m","v","t","cfg")
+    def __init__(self, params, cfg: Config):
+        self.params = params
+        self.m = [array('f', [0.0]) * p.numel() for p in params]
+        self.v = [array('f', [0.0]) * p.numel() for p in params]
+        self.t = 0
+        self.cfg = cfg
+
+    def step(self, lr):
+        self.t += 1
+        b1,b2,eps = self.cfg.beta1, self.cfg.beta2, self.cfg.eps
+        for pi,p in enumerate(self.params):
+            if p.grad is None: continue
+            n = p.numel()
+            m = self.m[pi]; v = self.v[pi]
+            for i in range(n):
+                g = p.grad.data[i]
+                m[i] = b1*m[i] + (1-b1)*g
+                v[i] = b2*v[i] + (1-b2)*g*g
+                mh = m[i] / (1 - (b1 ** self.t))
+                vh = v[i] / (1 - (b2 ** self.t))
+                p.data[i] -= lr * mh / (math.sqrt(vh) + eps)
+                p.grad.data[i] = 0.0
+
+# ===================== SECTION: Data (tokenizer + optional multiprocessing prefetch) =====================
+
+class CharTokenizer:
+    __slots__ = ("stoi","itos","bos","vocab_size")
+    def __init__(self, docs):
+        uchars = sorted(set("".join(docs)))
+        self.stoi = {ch:i for i,ch in enumerate(uchars)}
+        self.itos = {i:ch for ch,i in self.stoi.items()}
+        self.bos = len(uchars)
+        self.vocab_size = len(uchars) + 1
+
+    def encode(self, s):
+        return [self.bos] + [self.stoi[ch] for ch in s] + [self.bos]
+
+    def decode(self, ids):
+        out=[]
+        for i in ids:
+            if i == self.bos: break
+            out.append(self.itos.get(i,"?"))
+        return "".join(out)
+
+def make_batch(docs, tok: CharTokenizer, B, T):
+    idx = [[tok.bos]*T for _ in range(B)]
+    tgt = [[tok.bos]*T for _ in range(B)]
+    for b in range(B):
+        doc = random.choice(docs)
+        ids = tok.encode(doc)
+        n = min(T+1, len(ids))
+        seq = ids[:n]
+        # pad
+        seq = seq + [tok.bos] * (T+1 - len(seq))
+        for t in range(T):
+            idx[b][t] = seq[t]
+            tgt[b][t] = seq[t+1]
+    return idx, tgt
+
+class Prefetcher:
+    # optional multiprocessing prefetch (default off)
+    def __init__(self, docs, tok, B, T, max_q=8):
+        self.q = Queue(maxsize=max_q)
+        self.p = Process(target=self._worker, args=(self.q, docs, tok, B, T))
+        self.p.daemon = True
+
+    @staticmethod
+    def _worker(q, docs, tok, B, T):
+        random.seed(1234)
+        while True:
+            q.put(make_batch(docs, tok, B, T))
+
+    def start(self):
+        self.p.start()
+
+    def get(self):
+        return self.q.get()
+
+# ===================== SECTION: Inference (step mode with KV cache) =====================
+
+def gpt_generate_step(params: GPTParams, tok: CharTokenizer, cfg: Config, prompt_ids, max_new=32, temperature=0.8):
+    # Pure python step-mode forward (no tape), with KV cache preallocated, fused step attention.
+    # This is a minimal reference; uses packed weights but uses python loops.
+    C = cfg.n_embd; H = cfg.n_head; D = C//H; L = cfg.n_layer
+    Tmax = cfg.block_size
+    B = 1
+    cache = [KVCache(Tmax, H, B, D) for _ in range(L)]
+    ws = [AttnStepWorkspace(H, Tmax) for _ in range(L)]
+
+    # helpers: linear for vector
+    def lin_vec(xC, W_OxC):
+        O,C2 = W_OxC.shape
+        y = array('f', [0.0]) * O
+        for o in range(O):
+            s=0.0
+            woff=o*C2
+            for c in range(C2):
+                s += xC[c]*W_OxC.data[woff+c]
+            y[o]=s
+        return y
+
+    def rms_vec(xC, eps=1e-5):
+        ms=0.0
+        for v in xC: ms += v*v
+        ms /= len(xC)
+        inv = 1.0/math.sqrt(ms+eps)
+        y=array('f',[0.0])*len(xC)
+        for i,v in enumerate(xC): y[i]=v*inv
+        return y
+
+    ids = list(prompt_ids)
+    for t in range(min(len(ids), Tmax)):
+        pass
+
+    # run prompt to fill cache
+    for pos in range(min(len(ids), Tmax)):
+        token_id = ids[pos]
+        # x = wte[token] + wpe[pos]
+        x = array('f', [0.0]) * C
+        for c in range(C):
+            x[c] = params.wte.data[token_id*C+c] + params.wpe.data[pos*C+c]
+        x = rms_vec(x)
+        for li in range(L):
+            x_res = x
+            x1 = rms_vec(x)
+            # qkv = x1 @ wqkv^T -> [3C]
+            qkv = lin_vec(x1, params.wqkv[li])
+            q = qkv[0*C:1*C]; k = qkv[1*C:2*C]; v = qkv[2*C:3*C]
+            # write kv cache per head
+            for h in range(H):
+                cache[li].set_kv(pos, 0, h, k[h*D:(h+1)*D], is_k=True)
+                cache[li].set_kv(pos, 0, h, v[h*D:(h+1)*D], is_k=False)
+            # attn step
+            out_heads = array('f', [0.0]) * C
+            Kacc = cache[li].getK_accessor(0)
+            Vacc = cache[li].getV_accessor(0)
+            PyKernels.attn_step_fwd(q, Kacc, Vacc, pos, out_heads, ws[li], Tmax, D)
+            # proj
+            attn_out = lin_vec(out_heads, params.wo[li])
+            for c in range(C):
+                x[c] = attn_out[c] + x_res[c]
+            # ffn
+            x_res = x
+            x2 = rms_vec(x)
+            # fc1
+            act = lin_vec(x2, params.fc1[li])  # [4C]
+            for i in range(4*C):
+                if act[i] < 0.0: act[i] = 0.0
+            ff = lin_vec(act, params.fc2[li])  # [C]
+            for c in range(C):
+                x[c] = ff[c] + x_res[c]
+
+    # sampling loop
+    for pos in range(len(ids), min(len(ids)+max_new, Tmax)):
+        token_id = ids[-1]
+        # forward one step (similar to above but using current pos)
+        x = array('f', [0.0]) * C
+        for c in range(C):
+            x[c] = params.wte.data[token_id*C+c] + params.wpe.data[pos*C+c]
+        x = rms_vec(x)
+        for li in range(L):
+            x_res = x
+            x1 = rms_vec(x)
+            qkv = lin_vec(x1, params.wqkv[li])
+            q = qkv[0*C:1*C]; k = qkv[1*C:2*C]; v = qkv[2*C:3*C]
+            for h in range(H):
+                cache[li].set_kv(pos, 0, h, k[h*D:(h+1)*D], is_k=True)
+                cache[li].set_kv(pos, 0, h, v[h*D:(h+1)*D], is_k=False)
+            out_heads = array('f', [0.0]) * C
+            Kacc = cache[li].getK_accessor(0)
+            Vacc = cache[li].getV_accessor(0)
+            PyKernels.attn_step_fwd(q, Kacc, Vacc, pos, out_heads, ws[li], Tmax, D)
+            attn_out = lin_vec(out_heads, params.wo[li])
+            for c in range(C):
+                x[c] = attn_out[c] + x_res[c]
+            x_res = x
+            x2 = rms_vec(x)
+            act = lin_vec(x2, params.fc1[li])
+            for i in range(4*C):
+                if act[i] < 0.0: act[i] = 0.0
+            ff = lin_vec(act, params.fc2[li])
+            for c in range(C):
+                x[c] = ff[c] + x_res[c]
+        # logits
+        logits = lin_vec(x, params.lm_head)  # [V]
+        # sample
+        V = len(logits)
+        # temperature + stable softmax sampling
+        m = max(logits)
+        probs = [0.0]*V
+        s=0.0
+        for i in range(V):
+            e = math.exp((logits[i]-m)/max(1e-6,temperature))
+            probs[i]=e; s+=e
+        r = random.random()*s
+        cum=0.0
+        nxt=V-1
+        for i,p in enumerate(probs):
+            cum += p
+            if cum >= r:
+                nxt=i; break
+        ids.append(nxt)
+        if nxt == tok.bos:
+            break
+    return ids
+
+# ===================== SECTION: Main (train + inference demo) =====================
+
+def main():
+    # load tiny dataset
+    if not os.path.exists('input.txt'):
+        # minimal fallback without urllib (keep stdlib-only constraint: urllib is stdlib, but user requested only math/random/os/array/multiprocessing)
+        # so we just create a tiny dataset if missing.
+        with open('input.txt','w',encoding='utf-8') as f:
+            f.write("anna\nbob\ncarla\ndavid\nemma\nfrank\n")
+    docs = [line.strip() for line in open('input.txt', encoding='utf-8') if line.strip()]
+    random.shuffle(docs)
+
+    tok = CharTokenizer(docs)
+    cfg = Config()
+    cfg.vocab_size = tok.vocab_size
+
+    backend = PyBackend()
+
+    params = GPTParams(backend, cfg)
+    optim = Adam(params.parameters(), cfg)
+
+    # workspaces (by layer, by batch) to avoid per-step allocation
+    B = cfg.batch_size; T = cfg.block_size
+    attn_ws_by_layer = [AttnTrainWorkspace(B, cfg.n_head, T) for _ in range(cfg.n_layer)]
+    ce_ws = CEWorkspace(B, T)
+
+    # optional prefetch (off by default)
+    prefetch = None  # Prefetcher(docs, tok, B, T); prefetch.start()
+
+    for step in range(cfg.steps):
+        if prefetch is None:
+            idx_bt, tgt_bt = make_batch(docs, tok, B, T)
+        else:
+            idx_bt, tgt_bt = prefetch.get()
+
+        tape, loss = gpt_forward_train(backend, params, idx_bt, tgt_bt, cfg, attn_ws_by_layer, ce_ws)
+        tape.backward(loss)
+
+        lr_t = cfg.lr * (1.0 - step / max(1, cfg.steps))
+        optim.step(lr_t)
+
+        if (step+1) % 10 == 0:
+            print(f"step {step+1:4d}/{cfg.steps}  loss {loss.data[0]:.4f}")
+
+    # inference
+    print("\n--- inference ---")
+    for _ in range(10):
+        ids = gpt_generate_step(params, tok, cfg, [tok.bos], max_new=cfg.block_size, temperature=0.8)
+        print(tok.decode(ids[1:]))
 
 if __name__ == "__main__":
     main()
